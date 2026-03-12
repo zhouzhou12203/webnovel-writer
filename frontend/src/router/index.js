@@ -31,6 +31,11 @@ const routes = [
                 component: () => import('../views/ProjectView.vue')
             },
             {
+                path: 'prompts',
+                name: 'prompts',
+                component: () => import('../views/PromptConfigView.vue')
+            },
+            {
                 path: 'outline',
                 name: 'outline',
                 component: () => import('../views/OutlineView.vue')
@@ -70,6 +75,7 @@ const routes = [
 
     // Legacy redirects
     { path: '/project', redirect: '/workspace/project' },
+    { path: '/prompts', redirect: '/workspace/prompts' },
     { path: '/outline', redirect: '/workspace/outline' },
     { path: '/write', redirect: '/workspace/write' },
     { path: '/write/:chapter', redirect: to => `/workspace/write/${to.params.chapter}` },

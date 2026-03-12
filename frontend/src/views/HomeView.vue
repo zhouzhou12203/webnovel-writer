@@ -1,7 +1,7 @@
 <!-- Copyright (c) 2026 左岚. All rights reserved. -->
 <!-- HomeView.vue - 项目总览（第一层） -->
 <script setup>
-import { ref, onMounted } from 'vue'
+import { computed, ref, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { projectsApi, aiApi } from '../api'
 import { useProjectStore } from '../stores/project'
@@ -19,7 +19,7 @@ const genres = ref([])
 
 // Create modal
 const showCreateModal = ref(false)
-const newProject = ref({ name: '', path: '', genre: '' })
+const newProject = ref({ name: '', path: '', genre: '', substyle: '' })
 const showAdvancedPath = ref(false)
 const creating = ref(false)
 
@@ -41,19 +41,46 @@ onMounted(() => {
 async function loadGenres() {
   try {
     const { data } = await aiApi.getGenres()
-    genres.value = data.genres || []
+    genres.value = normalizeGenres(data.genres || [])
   } catch (e) {
     console.warn('加载题材列表失败，使用默认', e)
-    genres.value = [
-      { id: '修仙', name: '修仙' },
-      { id: '玄幻', name: '玄幻' },
-      { id: '都市', name: '都市' },
-      { id: '科幻', name: '科幻' },
-      { id: '规则怪谈', name: '规则怪谈' },
-      { id: '其他', name: '其他' }
-    ]
+    genres.value = normalizeGenres([
+      { id: '玄幻', name: '玄幻', default_substyle: '热血升级流', substyles: [{ id: '热血升级流', name: '热血升级流' }] },
+      { id: '规则怪谈', name: '规则怪谈', default_substyle: '规则生存流', substyles: [{ id: '规则生存流', name: '规则生存流' }] },
+      { id: '现代言情', name: '现代言情', default_substyle: '高甜拉扯', substyles: [{ id: '高甜拉扯', name: '高甜拉扯' }] }
+    ])
   }
 }
+
+function normalizeGenres(items = []) {
+  return items.map(item => ({
+    ...item,
+    aliases: item.aliases || [],
+    substyles: item.substyles || []
+  }))
+}
+
+function findGenreOption(value) {
+  if (!value) return null
+  const raw = String(value).trim()
+  return genres.value.find(g =>
+    g.id === raw ||
+    g.name === raw ||
+    (g.aliases || []).includes(raw)
+  ) || null
+}
+
+function pickSubstyleId(genreOption, preferred = '') {
+  const options = genreOption?.substyles || []
+  if (!options.length) return ''
+  const raw = String(preferred || '').trim()
+  const matched = options.find(s => s.id === raw || s.name === raw)
+  return matched?.id || genreOption.default_substyle || options[0].id
+}
+
+const availableCreateSubstyles = computed(() => {
+  return findGenreOption(newProject.value.genre)?.substyles || []
+})
 
 async function loadProjects() {
   loading.value = true
@@ -75,7 +102,13 @@ async function openProject(project) {
 }
 
 function openCreateModal() {
-  newProject.value = { name: '', path: '', genre: genres.value[0]?.id || '修仙' }
+  const defaultGenre = genres.value[0] || null
+  newProject.value = {
+    name: '',
+    path: '',
+    genre: defaultGenre?.id || '玄幻',
+    substyle: pickSubstyleId(defaultGenre)
+  }
   showAdvancedPath.value = false
   showCreateModal.value = true
 }
@@ -107,12 +140,18 @@ async function createProject() {
   }
 }
 
+watch(() => newProject.value.genre, (newVal) => {
+  const matched = findGenreOption(newVal)
+  newProject.value.substyle = pickSubstyleId(matched, newProject.value.substyle)
+})
+
 async function importProject() {
   if (!importPath.value) return
   importing.value = true
   try {
-    await projectsApi.import(importPath.value)
-    await projectStore.setCurrentProject(importPath.value)
+    const { data } = await projectsApi.import(importPath.value)
+    const resolvedPath = data.project?.path || importPath.value
+    await projectStore.setCurrentProject(resolvedPath)
     showImportModal.value = false
     router.push('/workspace/project')
   } catch (e) {
@@ -286,6 +325,12 @@ function getGenreIcon(genre) {
           <label>题材</label>
           <select v-model="newProject.genre" class="input">
             <option v-for="g in genres" :key="g.id" :value="g.id">{{ g.name }}</option>
+          </select>
+        </div>
+        <div class="form-group" v-if="availableCreateSubstyles.length">
+          <label>子风格</label>
+          <select v-model="newProject.substyle" class="input">
+            <option v-for="s in availableCreateSubstyles" :key="s.id" :value="s.id">{{ s.name }}</option>
           </select>
         </div>
         <div class="advanced-toggle" @click="showAdvancedPath = !showAdvancedPath">

@@ -1,6 +1,7 @@
 # Copyright (c) 2026 左岚. All rights reserved.
 """AI 写作 API - 使用 SkillExecutor 完整复用 .claude/skills 工作流"""
 
+import json
 import sys
 import re
 from pathlib import Path
@@ -9,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Query, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from dependencies import get_project_root
+from services.genre_catalog import canonical_genre_id, canonical_substyle_id, list_supported_genres
 
 router = APIRouter()
 
@@ -26,6 +28,7 @@ class AIConfig(BaseModel):
 class InitRequest(BaseModel):
     title: str
     genre: str
+    substyle: str = ""
     protagonist_name: str = ""
     golden_finger_name: str = ""
     golden_finger_type: str = ""
@@ -43,6 +46,10 @@ class PlanRequest(BaseModel):
 class WriteRequest(BaseModel):
     chapter: int
     word_count: int = 3500
+
+
+class ReviewRequest(BaseModel):
+    content: Optional[str] = None
 
 
 # get_project_root imported from dependencies
@@ -92,11 +99,14 @@ async def init_project_api(request: InitRequest, root: Path = Depends(get_projec
         raise HTTPException(status_code=400, detail="目标字数必须大于 0")
 
     executor = get_skill_executor(root)
+    genre = canonical_genre_id(request.genre)
+    substyle = canonical_substyle_id(genre, request.substyle)
 
     try:
         result = await executor.execute_init(
             title=request.title,
-            genre=request.genre,
+            genre=genre,
+            substyle=substyle,
             protagonist_name=request.protagonist_name,
             golden_finger_name=request.golden_finger_name,
             golden_finger_type=request.golden_finger_type,
@@ -115,12 +125,15 @@ async def init_project_stream_api(request: InitRequest, root: Path = Depends(get
         raise HTTPException(status_code=400, detail="目标字数必须大于 0")
 
     executor = get_skill_executor(root)
+    genre = canonical_genre_id(request.genre)
+    substyle = canonical_substyle_id(genre, request.substyle)
     async def event_generator():
         try:
             # 流式执行初始化
             async for update in executor.execute_init_stream(
                 title=request.title,
-                genre=request.genre,
+                genre=genre,
+                substyle=substyle,
                 protagonist_name=request.protagonist_name,
                 golden_finger_name=request.golden_finger_name,
                 golden_finger_type=request.golden_finger_type,
@@ -131,7 +144,7 @@ async def init_project_stream_api(request: InitRequest, root: Path = Depends(get
                 # SSE 格式: data: <json>\n\n
                 yield f"data: {update}\n\n"
         except Exception as e:
-            yield f'data: {{"type": "error", "message": "{str(e)}"}}\n\n'
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
             
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -170,13 +183,16 @@ async def plan_volume_stream_api(request: PlanRequest, root: Path = Depends(get_
     executor = get_skill_executor(root)
     
     async def event_generator():
-        if request.volume == 0:
-            generator = executor.execute_replan_outline_stream(guidance=request.guidance)
-        else:
-            generator = executor.execute_plan_stream(volume=request.volume, chapters_count=request.chapters_count)
-            
-        async for update in generator:
-            yield f"data: {update}\n\n"
+        try:
+            if request.volume == 0:
+                generator = executor.execute_replan_outline_stream(guidance=request.guidance)
+            else:
+                generator = executor.execute_plan_stream(volume=request.volume, chapters_count=request.chapters_count)
+
+            async for update in generator:
+                yield f"data: {update}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
             
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -231,8 +247,11 @@ async def write_chapter_stream_api(request: WriteRequest, root: Path = Depends(g
     executor = get_skill_executor(root)
     
     async def event_generator():
-        async for update in executor.execute_write_stream(chapter=request.chapter, word_count=request.word_count):
-            yield f"data: {update}\n\n"
+        try:
+            async for update in executor.execute_write_stream(chapter=request.chapter, word_count=request.word_count):
+                yield f"data: {update}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
             
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -290,7 +309,7 @@ async def polish_chapter_stream_api(request: PolishRequest, root: Path = Depends
                     import json
                     yield f"data: {json.dumps(update, ensure_ascii=False)}\n\n"
         except Exception as e:
-            yield f'data: {{"type": "error", "message": "{str(e)}"}}\n\n'
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
             
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -315,21 +334,22 @@ async def polish_outline_stream_api(request: PolishOutlineRequest, root: Path = 
             ):
                 yield f"data: {update}\n\n"
         except Exception as e:
-            yield f'data: {{"type": "error", "message": "{str(e)}"}}\n\n'
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
             
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @router.post("/review")
-async def review_chapter_api(chapter: int, root: Path = Depends(get_project_root)):
+async def review_chapter_api(chapter: int, request: Optional[ReviewRequest] = None, root: Path = Depends(get_project_root)):
     """AI 审查章节（五维评分）"""
+    content = (request.content if request and request.content else "").strip()
+    if not content:
+        chapters_dir = root / "正文"
+        files = _find_chapter_files(chapters_dir, chapter)
+        if not files:
+            raise HTTPException(status_code=404, detail=f"未找到第{chapter}章")
+        content = files[0].read_text(encoding="utf-8")
 
-    chapters_dir = root / "正文"
-    files = _find_chapter_files(chapters_dir, chapter)
-    if not files:
-        raise HTTPException(status_code=404, detail=f"未找到第{chapter}章")
-
-    content = files[0].read_text(encoding="utf-8")
     if len(content.strip()) < 100:
         raise HTTPException(status_code=400, detail="章节内容过少（<100字），无法进行 AI 审查。请先生成或撰写正文。")
 
@@ -345,40 +365,7 @@ async def review_chapter_api(chapter: int, root: Path = Depends(get_project_root
 @router.get("/genres")
 async def get_genres():
     """获取支持的题材列表"""
-    genres_dir = SCRIPTS_PATH.parent / "templates" / "genres"
-    
-    # 基础题材（保底列表）
-    base_genres = [
-        {"id": "玄幻", "name": "玄幻"},
-        {"id": "奇幻", "name": "奇幻"},
-        {"id": "武侠", "name": "武侠"},
-        {"id": "仙侠", "name": "仙侠"},
-        {"id": "修仙", "name": "修仙"},
-        {"id": "都市", "name": "都市"},
-        {"id": "历史", "name": "历史"},
-        {"id": "军事", "name": "军事"},
-        {"id": "悬疑", "name": "悬疑"},
-        {"id": "科幻", "name": "科幻"},
-        {"id": "游戏", "name": "游戏"},
-        {"id": "体育", "name": "体育"},
-        {"id": "轻小说", "name": "轻小说"},
-        {"id": "诸天无限", "name": "诸天无限"},
-        {"id": "古代言情", "name": "古代言情"},
-        {"id": "现代言情", "name": "现代言情"},
-        {"id": "规则怪谈", "name": "规则怪谈"},
-    ]
-    
-    # 建立 ID 到对象的映射，方便合并
-    genres_map = {g["id"]: g for g in base_genres}
-    
-    # 从目录加载自定义模板题材
-    if genres_dir.exists():
-        for f in genres_dir.glob("*.md"):
-            # 如果已有重复 ID，以文件名为准（主要是为了保持一致性）
-            genres_map[f.stem] = {"id": f.stem, "name": f.stem}
-    
-    # 转换回列表
-    return {"genres": list(genres_map.values())}
+    return {"genres": list_supported_genres()}
 
 
 @router.get("/skills")
@@ -404,25 +391,10 @@ async def generate_ending_plan(
     root: Path = Depends(get_project_root)
 ):
     """生成收尾规划"""
-    from services.ai_service import get_ai_service
-    service = get_ai_service()
-
-    # 读取总纲
-    outline_file = root / "大纲" / "总纲.md"
-    outline = ""
-    if outline_file.exists():
-        outline = outline_file.read_text(encoding="utf-8")
-
-    # 读取当前进度信息
-    chapters_dir = root / "正文"
-    chapter_files = sorted(chapters_dir.glob("第*章*.md")) if chapters_dir.exists() else []
-    current_progress = f"已完成 {len(chapter_files)} 章"
-    if chapter_files:
-        last = chapter_files[-1]
-        current_progress += f"，最新章节: {last.stem}"
+    executor = get_skill_executor(root)
 
     try:
-        result = await service.generate_ending_plan(outline, current_progress, request.remaining_chapters)
+        result = await executor.execute_generate_ending_plan(request.remaining_chapters)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

@@ -103,27 +103,32 @@ export const useAiTaskStore = defineStore('aiTask', () => {
 
                 for (const line of lines) {
                     if (line.startsWith('data: ')) {
+                        let data
                         try {
-                            const data = JSON.parse(line.substring(6))
-
-                            if (data.type === 'step') {
-                                updateStep(data)
-                                // 如果有错误，也在这里处理
-                                if (data.status === 'failed') throw new Error(data.error || '步骤失败')
-                            } else if (data.type === 'content') {
-                                streamContent.value += data.chunk
-                                streamTarget.value = data.target
-                            } else if (data.type === 'done') {
-                                completeTask(true, data.message)
-                                return // 完成
-                            } else if (data.type === 'error') {
-                                throw new Error(data.message)
-                            }
+                            data = JSON.parse(line.substring(6))
                         } catch (e) {
                             console.error('Stream parse error:', e)
+                            continue
+                        }
+                        // Business logic outside parse try-catch
+                        if (data.type === 'step') {
+                            updateStep(data)
+                            if (data.status === 'failed') throw new Error(data.error || '步骤失败')
+                        } else if (data.type === 'content') {
+                            streamContent.value += data.chunk
+                            streamTarget.value = data.target
+                        } else if (data.type === 'done') {
+                            completeTask(data.success !== false, data.message)
+                            return
+                        } else if (data.type === 'error') {
+                            throw new Error(data.message)
                         }
                     }
                 }
+            }
+            // Stream ended without done/error event — mark as failed
+            if (isRunning.value) {
+                failTask('初始化流异常终止')
             }
         } catch (e) {
             console.error('Init Action Failed:', e)

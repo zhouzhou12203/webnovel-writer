@@ -16,7 +16,10 @@ export const projectsApi = {
     getStatus: () => api.get('/projects/status'),
     getConfig: () => api.get('/projects/config'),
     getSettings: () => api.get('/projects/settings'),
+    getPromptConfig: () => api.get('/projects/prompt-config'),
     updateConfig: (config) => api.put('/projects/config', config),
+    updatePromptConfig: (payload) => api.put('/projects/prompt-config', payload),
+    resetPromptConfig: (payload = {}) => api.post('/projects/prompt-config/reset', payload),
     init: (data) => api.post('/projects/init', data),
     getGenres: () => api.get('/projects/genres'),
     reset: () => api.delete('/projects/reset'),
@@ -45,7 +48,7 @@ export const outlinesApi = {
 export const chaptersApi = {
     getAll: () => api.get('/chapters'),
     get: (id) => api.get(`/chapters/${id}`),
-    update: (id, data) => api.put(`/chapters/${id}`, data),
+    update: (id, data, opts) => api.put(`/chapters/${id}`, data, opts && opts.projectRoot ? { params: { project_root: opts.projectRoot } } : undefined),
     delete: (id) => api.delete(`/chapters/${id}`),
     write: (data) => api.post('/chapters/write', data),
     review: (chapters) => api.post('/chapters/review', { chapters }),
@@ -107,7 +110,7 @@ export const aiApi = {
         headers: getAuthHeaders(),
         body: JSON.stringify({ chapter, word_count: wordCount })
     }),
-    reviewChapter: (chapter) => api.post('/ai/review', null, { params: { chapter } }),
+    reviewChapter: (chapter, content = '') => api.post('/ai/review', content ? { content } : null, { params: { chapter } }),
     planVolume: (volume, chaptersCount = 30, guidance = "") => api.post('/ai/plan', { volume, chapters_count: chaptersCount, guidance }),
     planVolumeStream: (volume, chaptersCount = 30, guidance = "") => fetch(`${api.defaults.baseURL}/ai/plan-stream`, {
         method: 'POST',

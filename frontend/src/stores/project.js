@@ -26,9 +26,12 @@ export const useProjectStore = defineStore('project', {
             targetWords: null,
             protagonist: null,
             genre: null,
+            substyle: null,
             title: null,
             description: null,
             status: '连载中',
+            outlineInvalidated: false,
+            outlineInvalidationReason: '',
             activities: [],
             loading: false,
             error: null
@@ -61,9 +64,12 @@ export const useProjectStore = defineStore('project', {
             this.targetWords = null
             this.protagonist = null
             this.genre = null
+            this.substyle = null
             this.title = null
             this.description = null
             this.status = '连载中'
+            this.outlineInvalidated = false
+            this.outlineInvalidationReason = ''
             this.activities = []
             this.loading = false
             this.error = null
@@ -91,9 +97,12 @@ export const useProjectStore = defineStore('project', {
                 this.targetWords = data.target_words // 从 API 读取目标字数
                 this.protagonist = data.protagonist
                 this.genre = data.genre
+                this.substyle = data.substyle
                 this.title = data.title // 从 API 读取标题
                 this.description = data.description
                 this.status = data.status || '连载中' // 从 API 读取状态
+                this.outlineInvalidated = !!data.outline_invalidated
+                this.outlineInvalidationReason = data.outline_invalidation_reason || ''
 
                 // 同时获取活动记录
                 await this.fetchActivities()

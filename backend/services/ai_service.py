@@ -61,7 +61,7 @@ class AIService:
         }
         
         # 添加 response_format 参数（强制 JSON 输出）
-        if response_format == "json":
+        if response_format in {"json", "json_object"}:
             payload["response_format"] = {"type": "json_object"}
 
         self._debug(f"Applying AI Request: {url} (Model: {self.model})")
@@ -94,7 +94,7 @@ class AIService:
                 raise last_error
 
 
-    async def chat_stream(self, messages: List[Dict], temperature: float = 0.7, max_tokens: int = 4000):
+    async def chat_stream(self, messages: List[Dict], temperature: float = 0.7, max_tokens: int = 16000):
         """流式发送聊天请求"""
         import aiohttp
         
@@ -196,6 +196,32 @@ class AIService:
                                                 yield delta["content"]
                                     except json.JSONDecodeError:
                                         continue
+
+                        # 某些网关可能在最后一个 data 行后不补换行；补一次 flush，避免丢失尾块导致“半句截断”。
+                        if buffer.strip():
+                            buffer += "\n"
+                            while '\n' in buffer:
+                                line, buffer = buffer.split('\n', 1)
+                                line = line.strip()
+
+                                if not line:
+                                    continue
+                                if line == "data: [DONE]":
+                                    self._debug(f"AI Stream completed (tail flush), total chunks: {chunk_count}")
+                                    return
+
+                                if line.startswith("data: "):
+                                    try:
+                                        data = json.loads(line[6:])
+                                        if "choices" in data and len(data["choices"]) > 0:
+                                            delta = data["choices"][0].get("delta", {})
+                                            if "content" in delta:
+                                                chunk_count += 1
+                                                if chunk_count == 1:
+                                                    self._debug("First SSE chunk received (tail flush)!")
+                                                yield delta["content"]
+                                    except json.JSONDecodeError:
+                                        continue
                         
                         self._debug(f"AI Stream ended, total chunks: {chunk_count}")
                         return
@@ -238,7 +264,7 @@ class AIService:
                 return [self.model]
         except Exception as e:
             print(f"Error fetching models from {url}: {e}")
-            return [self.model, "gpt-3.5-turbo", "gpt-4"]
+            return [self.model, "Qwen/Qwen2.5-7B-Instruct", "ZhipuAI/GLM-5", "grok-2-latest", "gemini-2.5-flash", "gpt-3.5-turbo", "gpt-4"]
 
     async def generate_outline(self, genre: str, premise: str, volumes: int = 1) -> str:
         """生成大纲"""
@@ -376,56 +402,6 @@ class AIService:
                 "suggestions": [],
                 "summary": result
             }
-
-    async def generate_ending_plan(self, outline: str, current_progress: str, remaining_chapters: int) -> dict:
-        """生成收尾规划"""
-        prompt = f"""你是一位拥有20年经验的金牌网文主编，擅长为小说设计精彩的收尾大结局。
-        
-        【任务】
-        请根据提供的小说总纲和当前进度，为这本小说规划最后的 {remaining_chapters} 章收尾大纲。
-        
-        【要求】
-        1. **伏笔回收**：必须列出通过这几章需要回收的关键伏笔。
-        2. **节奏紧凑**：每一章都必须有明确的推进目标，最后高潮迭起。
-        3. **结局圆满**：符合网文读者的期待，给出一个合理且精彩的结局。
-        4. **分章规划**：生成 {remaining_chapters} 个章节的详细大纲。
-        
-        【现有信息】
-        总纲：
-        {outline}
-        
-        当前进度/状态：
-        {current_progress}
-        
-        【输出格式（JSON）】
-        {{
-            "ending_straregy": "收尾策略简述（200字内）",
-            "chapters": [
-                {{
-                    "chapter_num": "自动推算的章节号",
-                    "title": "章节标题",
-                    "summary": "章节剧情概要（100字+）",
-                    "purpose": "本章核心作用（如：揭示真相、最终决战、情感升华）"
-                }},
-                ...
-            ]
-        }}
-        """
-        
-        try:
-            response = await self.chat(
-                messages=[
-                    {"role": "system", "content": "你是一位专业的网文主编策划。请用 JSON 格式回复。"},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.7,
-                max_tokens=4000,
-                response_format="json_object"
-            )
-            data = json.loads(response)
-            return {"success": True, "plan": data}
-        except Exception as e:
-            return {"success": False, "error": f"AI 规划失败: {str(e)}"}
 
     async def generate_titles(self, genre: str, outline: str) -> List[str]:
         """根据大纲生成书名"""

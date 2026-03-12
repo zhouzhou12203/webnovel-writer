@@ -5,6 +5,8 @@ import uuid
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Any
+from services.genre_catalog import canonical_genre_id, canonical_substyle_id
+from services.project_prompt_store import ensure_project_prompts
 
 # 全局配置目录
 GLOBAL_CONFIG_DIR = Path.home() / ".webnovel"
@@ -103,14 +105,20 @@ def list_projects() -> List[Dict[str, Any]]:
                     state = json.loads(state_file.read_text(encoding="utf-8"))
                     # 获取最新标题
                     new_title = ""
+                    new_genre = ""
                     if "project_info" in state:
                         new_title = state["project_info"].get("title", "")
+                        new_genre = state["project_info"].get("genre", "")
                     else:
                         new_title = state.get("title", "")
+                        new_genre = state.get("genre", "")
 
                     # 如果标题不一致，更新缓存
                     if new_title and new_title != p["name"]:
                         p["name"] = new_title
+                        updated = True
+                    if new_genre and new_genre != p.get("genre"):
+                        p["genre"] = new_genre
                         updated = True
                 except Exception:
                     pass
@@ -180,47 +188,54 @@ def get_current_project_path() -> Optional[Path]:
         return Path(project["path"])
     return None
 
-def create_project(name: str, path: str, genre: str = "修仙") -> Dict[str, Any]:
+def create_project(name: str, path: str, genre: str = "修仙", substyle: str = "") -> Dict[str, Any]:
     """新建项目"""
     project_path = Path(path).expanduser().resolve()
+    genre = canonical_genre_id(genre) or "玄幻"
+    substyle = canonical_substyle_id(genre, substyle)
+
+    # 先查重，再操作文件系统
+    data = _load_projects_data()
+    for p in data["projects"]:
+        if Path(p["path"]).expanduser().resolve() == project_path:
+            return {"error": "项目路径已存在", "project": p}
+
+    # 安全：后续操作文件系统
     project_path.mkdir(parents=True, exist_ok=True)
-    
+
     # 创建项目基础目录结构
     (project_path / "大纲").mkdir(exist_ok=True)
     (project_path / "正文").mkdir(exist_ok=True)
     (project_path / "设定集").mkdir(exist_ok=True)
     (project_path / ".webnovel").mkdir(exist_ok=True)
-    
+
     # 初始化 state.json
     state_file = project_path / ".webnovel" / "state.json"
     state = {
-        "title": name, 
-        "genre": genre, 
+        "title": name,
+        "genre": genre,
+        "substyle": substyle,
         "created_at": datetime.now().isoformat(),
         "initialized": False  # 新建项目默认未初始化，需通过 AI Init 完成
     }
     state_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    
-    # 添加到项目列表
-    data = _load_projects_data()
+    ensure_project_prompts(project_path, genre, substyle)
+
+    # 添加到项目列表（复用已加载的 data）
     project = {
         "id": str(uuid.uuid4()),
         "name": name,
         "path": str(project_path),
         "genre": genre,
+        "substyle": substyle,
         "created_at": datetime.now().strftime("%Y-%m-%d"),
         "last_opened": datetime.now().strftime("%Y-%m-%d")
     }
-    
-    # 检查是否已存在
-    for p in data["projects"]:
-        if Path(p["path"]).expanduser().resolve() == project_path:
-            return {"error": "项目路径已存在", "project": p}
-    
+
     data["projects"].append(project)
     data["current_project"] = project["path"]
     _save_projects_data(data)
-    
+
     return {"success": True, "project": project}
 
 def switch_project(project_id: str) -> Dict[str, Any]:
@@ -250,8 +265,16 @@ def import_project(path: str) -> Dict[str, Any]:
     if state_file.exists():
         try:
             state = json.loads(state_file.read_text(encoding="utf-8"))
-            name = state.get("title", name)
-            genre = state.get("genre", genre)
+            substyle = ""
+            if "project_info" in state:
+                name = state.get("project_info", {}).get("title", state.get("title", name))
+                genre = state.get("project_info", {}).get("genre", state.get("genre", genre))
+                substyle = state.get("project_info", {}).get("substyle", state.get("substyle", ""))
+            else:
+                name = state.get("title", name)
+                genre = state.get("genre", genre)
+                substyle = state.get("substyle", "")
+            ensure_project_prompts(project_path, genre, substyle)
         except Exception:
             pass
     

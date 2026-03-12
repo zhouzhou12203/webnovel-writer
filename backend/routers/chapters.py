@@ -1,6 +1,7 @@
 # Copyright (c) 2026 左岚. All rights reserved.
 """章节管理 API"""
 
+import json
 import re
 import time
 from pathlib import Path
@@ -67,6 +68,12 @@ class ReviewRequest(BaseModel):
 # get_project_root imported from dependencies
 
 
+def _get_skill_executor(project_root: Path):
+    from services.skill_executor import SkillExecutor
+    from services.ai_service import get_ai_service
+    return SkillExecutor(project_root, get_ai_service())
+
+
 def _find_chapter_files(chapters_dir: Path, chapter_id: int) -> List[Path]:
     """按章节号查找文件，兼容 `第002章` 这类前导零命名。"""
     exact = sorted(chapters_dir.glob(f"第{chapter_id}章*.md"))
@@ -106,11 +113,18 @@ def parse_chapter_file(file_path: Path) -> dict:
     if summary_match:
         summary = summary_match.group(1).strip()
 
+    # 计算正文字数（去掉标题行和已知占位符）
+    body = content
+    body = re.sub(r'^#.*$', '', body, flags=re.MULTILINE)  # 去掉标题行
+    body = body.replace('（开始您的创作...）', '').replace('（点击 AI 规划本卷自动生成）', '')
+    body = re.sub(r'<!--.*?-->', '', body, flags=re.DOTALL)  # 去掉 HTML 注释
+    word_count = len(body.strip())
+
     return {
         "id": chapter_id,
         "title": title.strip(),
         "content": content,
-        "word_count": len(content),
+        "word_count": word_count,
         "summary": summary,
         "path": str(file_path)
     }
@@ -160,6 +174,9 @@ def _has_blocking_review_issues(review_text: str) -> tuple[bool, str]:
         (r"设定(?:一致性)?(?:冲突|错误|不一致)", "审查提示设定冲突，已拦截自动提取"),
         (r"地点(?:冲突|错误|不一致)", "审查提示地点冲突，已拦截自动提取"),
         (r"角色名(?:错误|冲突|不一致|漂移)", "审查提示角色名冲突，已拦截自动提取"),
+        (r"主角命名漂移", "审查提示主角命名漂移，已拦截自动提取"),
+        (r"(?:风格跑偏|玄幻笔调不足)", "审查提示题材风格跑偏，已拦截自动提取"),
+        (r"(?:内容)?(?:疑似)?(?:截断|半句|未写完|未完成)", "审查提示正文可能截断，已拦截自动提取"),
         (r"(?:严重|高危).{0,6}BUG", "审查提示严重 BUG，已拦截自动提取"),
         (r"(?:需|必须)\s*(?:立即|尽快)?\s*修改", "审查标记需修改，已拦截自动提取"),
     ]
@@ -277,6 +294,18 @@ async def update_chapter(chapter_id: int, data: ChapterUpdate, root: Path = Depe
             title=f"第{chapter_id}章：{data.title or '无标题'}"
         )
 
+    # Bug #7: 更新 current_chapter 进度（只前进不后退）
+    state_file = root / ".webnovel" / "state.json"
+    if state_file.exists():
+        try:
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+            old_chapter = state.get("current_chapter", 0)
+            if chapter_id > old_chapter:
+                state["current_chapter"] = chapter_id
+                state_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
     # 保存即提取：内容有变化、或前次提取未成功 → 触发提取
     prev_ok = chapter_id in _extract_ok
     should_extract = (
@@ -284,15 +313,24 @@ async def update_chapter(chapter_id: int, data: ChapterUpdate, root: Path = Depe
         and bool(data.content.strip())
         and (content_changed or data.force_extract or not prev_ok)
     )
+    should_post_save_sync = bool(data.content.strip()) and content_changed
+    review_blocked, review_block_reason = _has_blocking_review_issues(data.review_raw or "")
     extract_blocked = False
     extract_block_reason = ""
+    post_save_sync_blocked = False
+    post_save_sync_block_reason = ""
 
     if should_extract and not data.force_extract:
-        blocked, reason = _has_blocking_review_issues(data.review_raw or "")
-        if blocked:
+        if review_blocked:
             should_extract = False
             extract_blocked = True
-            extract_block_reason = reason
+            extract_block_reason = review_block_reason
+
+    # 审查未通过时，阻断保存后的 RAG/连续性摘要写入，避免污染长期索引。
+    if should_post_save_sync and review_blocked:
+        should_post_save_sync = False
+        post_save_sync_blocked = True
+        post_save_sync_block_reason = review_block_reason
 
     task_id = None
 
@@ -326,12 +364,32 @@ async def update_chapter(chapter_id: int, data: ChapterUpdate, root: Path = Depe
 
         asyncio.create_task(extract_characters_background())
 
+    if should_post_save_sync:
+        import asyncio
+        from services.skill_executor import SkillExecutor
+        from services.ai_service import get_ai_service
+
+        async def post_save_sync_background():
+            try:
+                print(f"[保存后处理] 开始处理第{chapter_id}章（RAG + 连续性摘要）...")
+                ai_service = get_ai_service()
+                executor = SkillExecutor(project_root=root, ai_service=ai_service)
+                sync_result = await executor.sync_post_save_artifacts(chapter_id, data.content)
+                print(f"[保存后处理] 第{chapter_id}章完成: {sync_result}")
+            except Exception as e:
+                print(f"[保存后处理] 第{chapter_id}章失败: {e}")
+
+        asyncio.create_task(post_save_sync_background())
+
     return {
         "success": True,
         "path": str(chapter_file),
         "word_count": len(data.content),
         "task_id": task_id,
         "content_changed": content_changed,
+        "post_save_sync_triggered": should_post_save_sync,
+        "post_save_sync_blocked": post_save_sync_blocked,
+        "post_save_sync_block_reason": post_save_sync_block_reason,
         "extract_triggered": should_extract,
         "extract_blocked": extract_blocked,
         "extract_block_reason": extract_block_reason
@@ -435,16 +493,15 @@ async def extract_preview(chapter_id: int, req: ExtractPreviewRequest = None, ro
 @router.post("/{chapter_id}/extract-apply")
 async def extract_apply(chapter_id: int, req: ExtractApplyRequest, root: Path = Depends(get_project_root)):
     """将用户确认后的提取结果写入磁盘。"""
-    # 优先读磁盘文件，没有则用前端传来的 content
-    content = None
+    # 优先使用前端编辑器内容（未保存草稿），没有再回退读磁盘文件
+    content = (req.content if req and req.content else None)
     chapters_dir = root / "正文"
-    files = _find_chapter_files(chapters_dir, chapter_id)
-    if files:
-        content = files[0].read_text(encoding="utf-8")
-    elif req.content:
-        content = req.content
-    else:
-        raise HTTPException(status_code=404, detail="章节不存在且未提供内容")
+    if not content:
+        files = _find_chapter_files(chapters_dir, chapter_id)
+        if files:
+            content = files[0].read_text(encoding="utf-8")
+        else:
+            raise HTTPException(status_code=404, detail="章节不存在且未提供内容")
 
     from services.skill_executor import SkillExecutor
     from services.ai_service import get_ai_service
@@ -523,33 +580,42 @@ async def delete_chapter(chapter_id: int, root: Path = Depends(get_project_root)
 
 
 @router.post("/write")
-async def write_chapter(request: WriteRequest, project_root: Optional[str] = Query(None)):
-    """AI 创作章节（占位接口，需要集成 AI 服务）"""
-    # TODO: 集成 Context Agent 和写作流程
-    return {
-        "success": False,
-        "message": "AI 创作功能需要配置 AI 服务后使用",
-        "chapter": request.chapter
-    }
+async def write_chapter(request: WriteRequest, root: Path = Depends(get_project_root)):
+    """AI 创作章节（兼容旧入口，统一走 SkillExecutor 写作链）"""
+    executor = _get_skill_executor(root)
+    try:
+        result = await executor.execute_write(chapter=request.chapter)
+        return {
+            "success": result["success"],
+            "chapter": request.chapter,
+            "title": result.get("title", ""),
+            "content": result.get("content", ""),
+            "summary": result.get("summary", ""),
+            "review": result.get("review", {}),
+            "word_count": len(result.get("content", "")),
+            "path": result.get("path", ""),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/review")
-async def review_chapters(request: ReviewRequest, project_root: Optional[str] = Query(None)):
-    """审查章节（占位接口）"""
-    # TODO: 集成五维审查 Agents
+async def review_chapters(request: ReviewRequest, root: Path = Depends(get_project_root)):
+    """审查章节（兼容旧入口，统一走 SkillExecutor 审查链）"""
+    executor = _get_skill_executor(root)
+    chapters_dir = root / "正文"
     results = []
-    for chapter in request.chapters:
-        results.append({
-            "chapter": chapter,
-            "scores": {
-                "high_point": 0,  # 爽点
-                "consistency": 0,  # 一致性
-                "pacing": 0,  # 节奏
-                "ooc": 0,  # OOC
-                "continuity": 0  # 连贯性
-            },
-            "issues": [],
-            "suggestions": []
-        })
 
-    return {"results": results, "message": "审查功能需要配置 AI 服务后使用"}
+    for chapter in request.chapters:
+        files = _find_chapter_files(chapters_dir, chapter)
+        if not files:
+            results.append({"chapter": chapter, "success": False, "error": f"未找到第{chapter}章"})
+            continue
+        content = files[0].read_text(encoding="utf-8")
+        try:
+            result = await executor.execute_review(chapter_id=chapter, content=content)
+            results.append({"chapter": chapter, **result})
+        except Exception as e:
+            results.append({"chapter": chapter, "success": False, "error": str(e)})
+
+    return {"results": results}

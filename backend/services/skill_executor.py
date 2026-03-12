@@ -10,6 +10,23 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Any, List, Optional
+from services.genre_catalog import (
+    canonical_genre_id,
+    canonical_substyle_id,
+    get_genre_bucket,
+    get_substyle_entry,
+    get_conflict_examples,
+    get_extra_prohibitions,
+    get_positive_style,
+    get_trope_keywords,
+    get_knowledge_preferred_files,
+    get_template_preferred_files,
+    get_opening_instruction,
+    get_template_aliases,
+    GENERIC_POSITIVE_STYLE,
+    GENERIC_OPENING_INSTRUCTION,
+)
+from services.project_prompt_store import get_project_prompt_content
 
 # 项目根目录
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -271,6 +288,8 @@ class SkillExecutor:
         budgets: Dict[str, Dict[str, int]] = {
             "write": {
                 "core_constraints": 2800,
+                "genre_style": 1800,
+                "genre_examples": 1200,
                 "worldview": 1000,
                 "power_system": 1000,
                 "gold_finger": 1800,
@@ -293,6 +312,7 @@ class SkillExecutor:
                 "gold_finger": 1400,
                 "entity_libraries": 1400,
                 "genre_tropes": 1200,
+                "genre_examples": 900,
                 "current_outline": 12000,
                 "guidance": 1600,
             },
@@ -308,10 +328,12 @@ class SkillExecutor:
                 "chapter_planning": 1200,
                 "conflict_design": 1000,
                 "genre_tropes": 1000,
+                "genre_examples": 900,
             },
             "outline_polish": {
                 "content": 12000,
                 "requirements": 1800,
+                "genre_examples": 900,
             },
             "outline_entity_extract": {
                 "roster": 1800,
@@ -322,6 +344,7 @@ class SkillExecutor:
                 "suggestions": 1800,
                 "guide": 1600,
                 "typesetting": 1200,
+                "genre_examples": 1000,
             },
             "extract_state": {
                 "chunk_size": 5200,
@@ -410,6 +433,521 @@ class SkillExecutor:
             snippet = self._safe_text(item.get("content", ""))
             rows.append(f"- 第{chapter}章 场景{scene}（相关度 {score}）：{snippet}")
         return self._truncate_text("\n".join(rows), max_chars, keep_tail=False)
+
+    def _normalize_genre_key(self, genre: str) -> str:
+        text = self._safe_text(genre).strip()
+        text_l = text.lower()
+        bucket = get_genre_bucket(text)
+        if bucket:
+            return bucket
+        alias_map = {
+            "玄幻": "xuanhuan",
+            "修仙": "xuanhuan",
+            "仙侠": "xuanhuan",
+            "奇幻": "xuanhuan",
+            "xuanhuan": "xuanhuan",
+            "xianxia": "xuanhuan",
+            "系统流": "xuanhuan",
+            "武侠": "xuanhuan",
+            "规则怪谈": "rules-mystery",
+            "怪谈": "rules-mystery",
+            "悬疑": "rules-mystery",
+            "惊悚": "rules-mystery",
+            "恐怖": "rules-mystery",
+            "rules-mystery": "rules-mystery",
+            "黑暗题材": "dark",
+            "黑暗": "dark",
+            "dark": "dark",
+            "狗血言情": "dog-blood-romance",
+            "替身文": "dog-blood-romance",
+            "现代言情": "dog-blood-romance",
+            "言情": "dog-blood-romance",
+            "romance": "dog-blood-romance",
+            "dog-blood-romance": "dog-blood-romance",
+            "古言": "period-drama",
+            "古代言情": "period-drama",
+            "宫斗": "period-drama",
+            "历史": "period-drama",
+            "period-drama": "period-drama",
+            "现实题材": "realistic",
+            "现实": "realistic",
+            "现实向": "realistic",
+            "都市": "realistic",
+            "都市异能": "realistic",
+            "都市现实": "realistic",
+            "科幻": "realistic",
+            "军事": "realistic",
+            "体育": "realistic",
+            "realistic": "realistic",
+            "知乎短篇": "zhihu-short",
+            "短篇": "zhihu-short",
+            "轻小说": "zhihu-short",
+            "zhihu-short": "zhihu-short",
+        }
+        if text in alias_map:
+            return alias_map[text]
+
+        # 兼容 玄幻流/仙侠爽文/规则怪谈向 等题材变体写法
+        if any(k in text for k in ["玄幻", "修仙", "仙侠", "奇幻", "武侠", "系统流"]) or any(k in text_l for k in ["xuanhuan", "xianxia"]):
+            return "xuanhuan"
+        if any(k in text for k in ["规则怪谈", "怪谈", "悬疑", "惊悚", "恐怖"]) or "mystery" in text_l:
+            return "rules-mystery"
+        if any(k in text for k in ["狗血言情", "替身", "追妻火葬场", "甜宠", "虐恋"]) or "romance" in text_l:
+            return "dog-blood-romance"
+        if any(k in text for k in ["古言", "宫斗", "宅斗", "朝堂", "历史"]) or "period" in text_l:
+            return "period-drama"
+        if any(k in text for k in ["现实", "都市", "职场", "社会议题", "科幻", "军事", "体育"]) or "realistic" in text_l:
+            return "realistic"
+        if any(k in text for k in ["知乎短篇", "短篇", "反转短文", "轻小说"]) or "zhihu" in text_l:
+            return "zhihu-short"
+        if "黑暗" in text or "dark" in text_l:
+            return "dark"
+
+        return text_l
+
+    def _is_weird_mystery_genre(self, genre: str) -> bool:
+        key = self._normalize_genre_key(genre)
+        if key == "rules-mystery":
+            return True
+        text = self._safe_text(genre)
+        return any(k in text for k in ["规则怪谈", "怪谈", "诡异", "惊悚", "恐怖"])
+
+    def _should_block_weird_style_terms(self, genre: str, *signals: str) -> bool:
+        """非怪谈题材默认拦截诡异流术语；仅在显式声明融合怪谈时放行。"""
+        if self._is_weird_mystery_genre(genre):
+            return False
+
+        merged = "\n".join(self._safe_text(s) for s in signals if s)
+        allow_flags = ["允许怪谈元素", "融合怪谈", "怪谈支线", "诡异支线"]
+        return not any(flag in merged for flag in allow_flags)
+
+    def _filter_scenes_by_forbidden_terms(self, scenes: List[Dict[str, Any]], forbidden_terms: List[str]) -> List[Dict[str, Any]]:
+        if not scenes or not forbidden_terms:
+            return scenes
+        filtered: List[Dict[str, Any]] = []
+        for item in scenes:
+            snippet = self._safe_text(item.get("content", "")).lower()
+            if any(term.lower() in snippet for term in forbidden_terms):
+                continue
+            filtered.append(item)
+        return filtered
+
+    def _extract_markdown_section(self, content: str, heading_keywords: List[str]) -> str:
+        raw = self._safe_text(content)
+        if not raw or not heading_keywords:
+            return ""
+        lines = raw.splitlines()
+
+        start = -1
+        for i, line in enumerate(lines):
+            s = line.strip()
+            if not re.match(r"^##(?!#)\s*", s):
+                continue
+            if any(k in s for k in heading_keywords):
+                start = i
+                break
+        if start < 0:
+            return ""
+
+        end = len(lines)
+        for j in range(start + 1, len(lines)):
+            if re.match(r"^##(?!#)\s*", lines[j].strip()):
+                end = j
+                break
+        return "\n".join(lines[start:end]).strip()
+
+    def _get_effective_substyle(self, genre: str, substyle: str = "") -> str:
+        effective = canonical_substyle_id(genre, substyle)
+        if effective:
+            return effective
+        return canonical_substyle_id(genre, self._get_project_substyle())
+
+    def _build_substyle_instruction(self, genre: str, substyle: str = "", stage: str = "writing") -> str:
+        effective = self._get_effective_substyle(genre, substyle)
+        item = get_substyle_entry(genre, effective)
+        if not item:
+            return ""
+
+        lines = [
+            f"【子风格锁定】当前阶段：{stage}。",
+            f"当前题材：{canonical_genre_id(genre)}｜子风格：{item.get('name', effective)}。",
+        ]
+        description = self._safe_text(item.get("description", "")).strip()
+        if description:
+            lines.append(f"核心方向：{description}")
+
+        focus = item.get("focus") or []
+        if focus:
+            lines.append("必须体现：")
+            lines.extend(f"{idx}. {self._safe_text(point)}" for idx, point in enumerate(focus, start=1))
+
+        avoid = item.get("avoid") or []
+        if avoid:
+            lines.append("明确回避：")
+            lines.extend(f"- {self._safe_text(point)}" for point in avoid)
+
+        return "\n".join(lines)
+
+    def _extract_substyle_example_snippets(
+        self,
+        content: str,
+        keywords: List[str],
+        max_items: int = 5,
+        max_chars: int = 900,
+    ) -> str:
+        raw = self._safe_text(content)
+        if not raw or not keywords:
+            return ""
+
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", raw) if p.strip()]
+        matched: List[str] = []
+        seen: set[str] = set()
+        lowered_keywords = [k.lower() for k in keywords if k]
+
+        for para in paragraphs:
+            compact = re.sub(r"\s+", " ", para)
+            lower = compact.lower()
+            if not any(k in lower for k in lowered_keywords):
+                continue
+            compact = re.sub(r"`([^`]+)`", r"\1", compact)
+            compact = re.sub(r"\*\*([^*]+)\*\*", r"\1", compact)
+            compact = re.sub(r"^[-*]\s*", "", compact)
+            compact = compact.strip()
+            if len(compact) < 18:
+                continue
+            key = compact.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            matched.append(compact)
+            if len(matched) >= max_items:
+                break
+
+        if not matched:
+            return ""
+
+        merged = "\n".join(f"- {item}" for item in matched)
+        return self._truncate_text(merged, max_chars, keep_tail=False)
+
+    def _load_substyle_examples(self, genre: str, substyle: str = "", max_chars: int = 900) -> str:
+        effective = self._get_effective_substyle(genre, substyle)
+        item = get_substyle_entry(genre, effective)
+        if not item:
+            return ""
+
+        keywords = list(item.get("keywords") or [])
+        if not keywords:
+            return ""
+
+        snippets: List[str] = []
+        used = 0
+        sources: List[tuple[str, str]] = []
+
+        template_text = self._load_genre_template(genre)
+        if template_text:
+            sources.append(("题材模板", template_text))
+
+        guide_text = self._load_genre_style_guide(genre, max_chars=2200)
+        if guide_text:
+            sources.append(("题材指南", guide_text))
+
+        genre_dir = self._resolve_genre_knowledge_dir(genre)
+        if genre_dir:
+            for path in sorted(genre_dir.glob("*.md"))[:4]:
+                text = self._read_file(path)
+                if text:
+                    sources.append((path.stem, text))
+
+        budget_each = max(220, max_chars // max(1, min(len(sources), 3)))
+        for source_name, source_text in sources:
+            part = self._extract_substyle_example_snippets(
+                source_text,
+                keywords,
+                max_items=3,
+                max_chars=budget_each,
+            )
+            if not part:
+                continue
+            block = f"## {source_name}\n{part}"
+            if used + len(block) > max_chars and snippets:
+                break
+            snippets.append(block)
+            used += len(block)
+            if len(snippets) >= 3:
+                break
+
+        if snippets:
+            return self._truncate_text("\n\n".join(snippets), max_chars, keep_tail=False)
+
+        focus = item.get("focus") or []
+        if focus:
+            fallback = "\n".join(f"- {self._safe_text(point)}" for point in focus)
+            return self._truncate_text(fallback, max_chars, keep_tail=False)
+        return ""
+
+    def _load_genre_trope_focus(self, genre: str, source: str = "", max_chars: int = 1200) -> str:
+        """从通用套路库中提取当前题材对应片段，避免混入其他题材套路。"""
+        raw = self._safe_text(source).strip()
+        if not raw:
+            raw = self._load_reference("webnovel-init", "genre-tropes.md")
+        if not raw:
+            return ""
+
+        key = self._normalize_genre_key(genre)
+        keywords = get_trope_keywords(key)
+        section = self._extract_markdown_section(raw, keywords) if keywords else ""
+
+        # 未命中时，回退到题材模板（仍然是按题材）
+        if not section:
+            section = self._load_genre_template(genre)
+        if not section:
+            # 不再回退到混合套路总表，避免跨题材污染
+            return ""
+
+        return self._truncate_text(section, max_chars, keep_tail=False)
+
+    def _resolve_genre_knowledge_dir(self, genre: str) -> Optional[Path]:
+        key = self._normalize_genre_key(genre)
+        if not key:
+            return None
+        genre_dir = CLAUDE_DIR / "genres" / key
+        return genre_dir if genre_dir.exists() else None
+
+    def _extract_genre_example_snippets(self, content: str, max_items: int = 8, max_chars: int = 1200) -> str:
+        raw = self._safe_text(content)
+        if not raw:
+            return ""
+
+        lines = raw.splitlines()
+        snippets: List[str] = []
+        seen: set[str] = set()
+
+        for i, line in enumerate(lines):
+            s = line.strip()
+            if not s:
+                continue
+            if not re.search(r"(示例|例子|样例|范例)", s):
+                continue
+            if re.search(r"(错误示例|反例|反面示例|❌)", s):
+                continue
+            if s.startswith("|") or s.count("|") >= 2:
+                continue
+
+            block: List[str] = [s]
+            for j in range(i + 1, min(len(lines), i + 8)):
+                nxt = lines[j].strip()
+                if not nxt:
+                    if len(block) >= 3:
+                        break
+                    continue
+                if re.match(r"^#{1,4}\s*", nxt):
+                    break
+                if re.search(r"(示例|例子|样例|范例)", nxt) and len(block) >= 2:
+                    break
+                if re.search(r"(错误示例|反例|反面示例|❌)", nxt):
+                    break
+                if nxt.startswith("|") or nxt.count("|") >= 2:
+                    continue
+                if nxt.startswith("```"):
+                    continue
+                block.append(nxt)
+                if len(" ".join(block)) >= 180:
+                    break
+
+            candidate = " ".join(block).strip()
+            candidate = re.sub(r"```+", "", candidate)
+            candidate = re.sub(r"`([^`]+)`", r"\1", candidate)
+            candidate = re.sub(r"\*\*([^*]+)\*\*", r"\1", candidate)
+            candidate = re.sub(r"^[-*]\s*", "", candidate)
+            candidate = re.sub(r"\s{2,}", " ", candidate)
+            if len(candidate) < 18:
+                continue
+            if re.search(r"(错误示例|反例|反面示例|❌)", candidate):
+                continue
+            key = candidate.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            snippets.append(candidate)
+            if len(snippets) >= max_items:
+                break
+
+        if not snippets:
+            return ""
+
+        merged = "\n".join(f"- {item}" for item in snippets)
+        return self._truncate_text(merged, max_chars, keep_tail=False)
+
+    def _load_genre_style_examples(self, genre: str, substyle: str = "", max_chars: int = 1200) -> str:
+        """按题材动态加载"示例片段"，用于风格对齐（只学表达，不照抄）。"""
+        genre_dir = self._resolve_genre_knowledge_dir(genre)
+        effective_substyle = self._get_effective_substyle(genre, substyle)
+
+        key = self._normalize_genre_key(genre)
+        ordered = get_knowledge_preferred_files(key)
+        files: List[Path] = []
+        if genre_dir:
+            for name in ordered:
+                p = genre_dir / name
+                if p.exists():
+                    files.append(p)
+            if not files:
+                files = sorted(genre_dir.glob("*.md"))[:3]
+
+        snippets: List[str] = []
+        used = 0
+        budget_each = max(260, max_chars // max(1, min(3, len(files) if files else 1)))
+        for p in files[:3]:
+            text = self._read_file(p)
+            if not text:
+                continue
+            part = self._extract_genre_example_snippets(text, max_items=4, max_chars=budget_each)
+            if not part:
+                continue
+            header = f"## {p.stem}\n{part}"
+            cost = len(header)
+            if used + cost > max_chars and snippets:
+                break
+            snippets.append(header)
+            used += cost
+
+        substyle_examples = self._load_substyle_examples(
+            genre,
+            effective_substyle,
+            max_chars=max(260, min(700, max_chars // 2)),
+        )
+        if substyle_examples:
+            snippets.insert(0, f"## 子风格示例（{effective_substyle}）\n{substyle_examples}")
+
+        merged = "\n\n".join(snippets).strip()
+        if merged:
+            return self._truncate_text(merged, max_chars, keep_tail=False)
+
+        # 兜底：至少提供当前题材文档片段
+        fallback = self._load_substyle_examples(genre, effective_substyle, max_chars=max_chars)
+        if fallback:
+            return fallback
+        fallback = self._load_genre_style_guide(genre, max_chars=max_chars)
+        return fallback or ""
+
+    def _build_genre_guard_instruction(self, genre: str, stage: str = "writing") -> str:
+        key = self._normalize_genre_key(genre)
+        examples = get_conflict_examples(key)
+        base = (
+            f"【题材锁定（最高优先级）】当前题材：{genre}。\n"
+            f"当前阶段：{stage}。\n"
+            f"冲突、危机、张力必须来自题材本身（{examples}）。\n"
+            f'环境描写、氛围渲染必须服务于"{genre}"核心阅读体验。'
+        )
+        prohibitions = get_extra_prohibitions(key)
+        if prohibitions:
+            genre_label = genre or key
+            base += f"\n【{genre_label}额外禁令】\n{prohibitions}"
+        return base
+
+    def _build_genre_positive_style_instruction(self, genre: str, stage: str = "writing") -> str:
+        key = self._normalize_genre_key(genre)
+        style_text = get_positive_style(key)
+        genre_label = genre or key
+        return f"【{genre_label}正向风格锚定】当前阶段：{stage}。\n{style_text}"
+
+    def _build_opening_chapter_instruction(self, genre: str, substyle: str, chapter: int, chapter_outline: str = "") -> str:
+        """给第1章补一段条件式约束，只强化大纲已有内容。"""
+        if chapter != 1:
+            return ""
+
+        key = self._normalize_genre_key(genre)
+        substyle_text = self._safe_text(substyle)
+        outline_hint = "以下要求只用于强化本章大纲已有内容，禁止为了满足节奏私自新增事件、收益、反制、机缘或结局。"
+
+        specific = get_opening_instruction(key)
+        if specific:
+            return (
+                "【第1章开篇约束（以大纲为准）】\n"
+                f"{outline_hint}\n"
+                f"{specific}"
+            )
+        # 通用回退
+        return (
+            f"【第1章开篇约束（以大纲为准）】当前子风格：{substyle_text or '未指定'}。\n"
+            f"{outline_hint}\n"
+            f"{GENERIC_OPENING_INSTRUCTION}"
+        )
+
+    def _has_abrupt_tail(self, content: str) -> bool:
+        """检测正文是否疑似半句截断。"""
+        text = self._safe_text(content).rstrip()
+        if not text or len(text) < 120:
+            return False
+        if re.search(r'[。！？!?…】）》」』\u201c\u201d"\x27]\s*$', text):
+            return False
+
+        tail = text[-90:]
+        # 典型未完成尾部：停在逗号/冒号/引导词/连接词后
+        if re.search(r"[，、:：；;\-—]\s*$", text):
+            return True
+        if re.search(r"(目光|声音|身影|下一瞬|仿佛|像是|他|她|它|而|但|却|并且|于是)\s*$", tail):
+            return True
+        # 末尾没有终止标点，且长度较长，按不完整处理
+        return True
+
+    async def _repair_abrupt_tail(
+        self,
+        chapter: int,
+        genre: str,
+        chapter_outline: str,
+        content: str,
+    ) -> str:
+        """在不改动前文的前提下补全被截断的结尾。"""
+        raw = self._safe_text(content).rstrip()
+        if not raw or not self._has_abrupt_tail(raw) or not self.ai_service:
+            return raw
+
+        style_bundle, normalized_genre, normalized_substyle = self._build_stage_style_bundle(
+            genre,
+            self._get_project_substyle(),
+            stage="结尾补写",
+            genre_style_chars=500,
+            genre_examples_chars=400,
+            substyle_examples_chars=300,
+        )
+        substyle_display = normalized_substyle or "默认子风格"
+        style_section = f"【当前阶段题材协议】\n{style_bundle}\n\n" if style_bundle else ""
+
+        prompt = f"""{style_section}你是网文总编。下面正文疑似在结尾被截断，请只补写结尾收束段。
+
+【硬性要求】
+1. 只补写结尾 1-4 句，不得改写前文；
+2. 严格符合题材"{normalized_genre}"与子风格"{substyle_display}"的当前阶段创作协议，不得回切旧题材腔调；
+3. 延续本章大纲，不越界写到下一章核心事件；
+4. 必须以完整句结束（句号/问号/感叹号/省略号）。
+
+【本章大纲（节选）】
+{self._truncate_text(chapter_outline, 1200, keep_tail=False)}
+
+【正文末尾片段】
+{self._truncate_text(raw, 1600, keep_tail=True)}
+
+请直接输出"补写内容"，不要解释。"""
+        try:
+            appendix = await self.ai_service.chat(
+                [{"role": "user", "content": prompt}],
+                temperature=0.4,
+                max_tokens=380,
+            )
+            appendix = self._safe_text(appendix).strip()
+            if not appendix:
+                return raw
+            # 防止模型整段重写全文
+            if len(appendix) > 900 or raw[:120] in appendix:
+                return raw
+            if appendix in raw:
+                return raw
+            if not re.search(r'[。！？!?…】）》」』\u201c\u201d"\x27]\s*$', appendix):
+                appendix = appendix.rstrip() + "。"
+            return f"{raw}\n{appendix}".strip()
+        except Exception:
+            return raw
 
     def _split_text_chunks(self, text: str, chunk_size: int, overlap: int = 0) -> List[str]:
         """将长文本切分为带重叠窗口，减少长章抽取遗漏。"""
@@ -580,6 +1118,14 @@ class SkillExecutor:
     def _build_polish_prompt(self, chapter_id: int, content: str, suggestions: str) -> str:
         """构建润色 prompt（统一非流式与流式），并按预算压缩上下文。"""
         polish_budget = self._get_context_budgets("polish")
+        genre = self._get_project_genre()
+        substyle = self._get_project_substyle()
+        chapter_outline = self._find_chapter_outline(chapter_id)
+        genre_writer_prompt = self._load_genre_writer_prompt(genre, stage="正文润色")
+        substyle_writer_prompt = self._load_substyle_writer_prompt(genre, substyle, stage="正文润色")
+        genre_guard = self._build_genre_guard_instruction(genre, stage="正文润色")
+        positive_style_instruction = self._build_genre_positive_style_instruction(genre, stage="正文润色")
+        substyle_instruction = self._build_substyle_instruction(genre, substyle, stage="正文润色")
         polish_guide = self._truncate_text(
             self._load_reference("webnovel-write", "polish-guide.md"),
             polish_budget.get("guide", 1600),
@@ -595,11 +1141,22 @@ class SkillExecutor:
             polish_budget.get("suggestions", 1800),
             keep_tail=True,
         )
+        genre_examples_for_prompt = self._truncate_text(
+            self._load_genre_style_examples(genre, substyle, max_chars=polish_budget.get("genre_examples", 1000)),
+            polish_budget.get("genre_examples", 1000),
+            keep_tail=False,
+        )
+        substyle_examples_for_prompt = self._truncate_text(
+            self._load_substyle_examples(genre, substyle, max_chars=polish_budget.get("genre_examples", 700)),
+            polish_budget.get("genre_examples", 700),
+            keep_tail=False,
+        )
         content_for_prompt = self._truncate_text(
             content,
             polish_budget.get("content", 10000),
             keep_tail=True,
         )
+        chapter_outline_for_prompt = self._truncate_text(chapter_outline, 1800, keep_tail=False)
 
         return f"""你是一位享誉全球的文学大师和资深网文主编。你的任务是**深度润色**第{chapter_id}章，使其脱胎换骨。
 
@@ -610,6 +1167,25 @@ class SkillExecutor:
 2. **情绪张力**：强化冲突和人物内心的波澜，消灭平淡。
 3. **文采修辞**：优化遣词造句，去除口语化和流水账，使用更精准、更具文学性的表达。
 4. **节奏掌控**：长短句结合，调整叙事节奏，使其更符合网文阅读体验。
+
+【题材锁定（最高优先级）】
+当前题材：{genre}
+当前子风格：{substyle}
+{genre_writer_prompt if genre_writer_prompt else ""}
+{substyle_writer_prompt if substyle_writer_prompt else ""}
+{genre_guard}
+{positive_style_instruction}
+{substyle_instruction}
+
+【本章大纲（用于防跑偏）】
+{chapter_outline_for_prompt if chapter_outline_for_prompt else "（无）"}
+
+【子风格示例（按当前子风格抽取）】
+{substyle_examples_for_prompt if substyle_examples_for_prompt else "（无）"}
+
+【题材示例（按当前题材动态加载）】
+{genre_examples_for_prompt if genre_examples_for_prompt else "（无）"}
+要求：只学习表达节奏与语气，不要照抄句子。
 
 【修改意见（用户指定）】
 {suggestions_for_prompt if suggestions_for_prompt.strip() else "（无特定意见，请按【核心指令】进行全面文学性提升）"}
@@ -1026,8 +1602,19 @@ class SkillExecutor:
             3200,
             keep_tail=False,
         )
+        style_bundle, normalized_genre, normalized_substyle = self._build_project_stage_style_bundle(
+            stage="设定冲突修复",
+            genre_style_chars=450,
+            genre_examples_chars=300,
+            substyle_examples_chars=250,
+        )
+        substyle_display = normalized_substyle or "默认子风格"
+        style_section = f"【当前阶段题材协议】\n{style_bundle}\n\n" if style_bundle else ""
 
-        prompt = f"""你是小说设定修复编辑器。请仅修复"设定一致性冲突"，禁止改剧情主线、禁止新增剧情点。
+        prompt = f"""{style_section}你是小说设定修复编辑器。请仅修复"设定一致性冲突"，禁止改剧情主线、禁止新增剧情点。
+
+【题材】
+{normalized_genre} / {substyle_display}
 
 【本章大纲（必须保持）】
 {outline_text or "（无）"}
@@ -1047,7 +1634,8 @@ class SkillExecutor:
 输出要求：
 1. 仅输出修复后的完整正文，不要解释。
 2. 优先做名词/身份/境界/地点一致性修正，不要改写叙事结构。
-3. 保持原文长度与段落结构，不能大幅删减（长度不低于原文的85%）。"""
+3. 保持原文长度与段落结构，不能大幅删减（长度不低于原文的85%）。
+4. 修复后的正文仍须保持当前题材/子风格的笔调，不得修成其他流派腔调。"""
 
         try:
             fixed = await self.ai_service.chat(
@@ -1098,6 +1686,14 @@ class SkillExecutor:
         next_outline = self._truncate_text(self._parse_outline(full_outline_text, chapter + 1), budget.get("next_outline", 1600), keep_tail=False)
         reference_obj = self._collect_consistency_reference(context_pack)
         reference_text = self._format_consistency_reference(reference_obj, budget.get("reference", 2600))
+        style_bundle, normalized_genre, normalized_substyle = self._build_project_stage_style_bundle(
+            stage="设定冲突扫描",
+            genre_style_chars=320,
+            genre_examples_chars=0,
+            substyle_examples_chars=0,
+        )
+        substyle_display = normalized_substyle or "默认子风格"
+        style_section = f"【当前阶段题材协议】\n{style_bundle}\n\n" if style_bundle else ""
 
         chunks = self._split_text_chunks(
             raw_content,
@@ -1115,7 +1711,10 @@ class SkillExecutor:
         ok_scans = 0
         total_scans = len(chunks)
         for idx, piece in enumerate(chunks, start=1):
-            scan_prompt = f"""你是小说设定一致性检查器。请检查"正文片段"是否与标准名/大纲冲突。
+            scan_prompt = f"""{style_section}你是小说设定一致性检查器。请检查"正文片段"是否与标准名/大纲冲突。
+
+【题材】
+{normalized_genre} / {substyle_display}
 
 【第{chapter}章大纲】
 {chapter_outline or "（无）"}
@@ -1639,6 +2238,7 @@ class SkillExecutor:
         self,
         title: str,
         genre: str,
+        substyle: str = "",
         protagonist_name: str = "",
         golden_finger_name: str = "",
         golden_finger_type: str = "",
@@ -1679,6 +2279,7 @@ class SkillExecutor:
                 project_dir=str(self.project_root),
                 title=title,
                 genre=genre,
+                substyle=substyle,
                 protagonist_name=protagonist_name,
                 golden_finger_name=golden_finger_name,
                 golden_finger_type=golden_finger_type
@@ -1689,34 +2290,76 @@ class SkillExecutor:
             yield make_step(8, "生成项目文件骨架", "completed")
             
             # Step 9: AI 自动填充内容
+            has_critical_failure = False
             if self.ai_service:
-                async for status in self._ai_fill_init_content_stream(title, genre, protagonist_name, golden_finger_name, golden_finger_type, additional_info):
+                async for status in self._ai_fill_init_content_stream(
+                    title,
+                    genre,
+                    substyle,
+                    protagonist_name,
+                    golden_finger_name,
+                    golden_finger_type,
+                    additional_info,
+                ):
                     yield json.dumps(status, ensure_ascii=False)
-                    
-            yield json.dumps({"type": "done", "success": True, "message": f"项目 '{title}' 初始化完成"}, ensure_ascii=False)
+                    if isinstance(status, dict) and status.get("status") == "failed":
+                        has_critical_failure = True
+
+            if has_critical_failure:
+                yield json.dumps({"type": "done", "success": False, "message": f"项目 '{title}' 初始化部分失败，请检查步骤状态"}, ensure_ascii=False)
+            else:
+                yield json.dumps({"type": "done", "success": True, "message": f"项目 '{title}' 初始化完成"}, ensure_ascii=False)
         except Exception as e:
             yield json.dumps({"type": "error", "message": f"项目初始化失败: {str(e)}"}, ensure_ascii=False)
 
-    async def _ai_fill_init_content_stream(self, title, genre, protagonist, gf_name, gf_type, additional_info=""):
+    async def _ai_fill_init_content_stream(self, title, genre, substyle, protagonist, gf_name, gf_type, additional_info=""):
         """流式填充 AI 初始化内容 - 使用串行调用确保一致性"""
         # 加载知识库
+        genre = canonical_genre_id(genre)
+        effective_substyle = self._get_effective_substyle(genre, substyle)
         try:
             genre_tropes = self._load_reference("webnovel-init", "genre-tropes.md")
             genre_template = self._load_genre_template(genre)
         except Exception:
             genre_tropes = ""
             genre_template = ""
+        trope_focus = self._load_genre_trope_focus(genre, genre_tropes, max_chars=1200)
+        style_guide = self._load_genre_style_guide(genre, max_chars=1800)
+        style_examples = self._load_genre_style_examples(genre, effective_substyle, max_chars=1000)
+        independent_stage_prompt = self._build_independent_stage_prompt_block(
+            genre,
+            effective_substyle,
+            stage="初始化/总纲规划",
+        )
+        substyle_instruction = self._build_substyle_instruction(genre, effective_substyle, stage="初始化/总纲规划")
+        substyle_examples = self._load_substyle_examples(genre, effective_substyle, max_chars=700)
+        genre_guard = self._build_genre_guard_instruction(genre, stage="初始化/总纲规划")
+        positive_style_instruction = self._build_genre_positive_style_instruction(genre, stage="初始化/总纲规划")
 
         base_context = f"""【小说信息】
 - 书名：《{title}》
 - 题材：{genre}
+- 子风格：{effective_substyle or "（未指定，按题材默认）"}
 - 主角名：{protagonist or "（待定）"}
 - 金手指：{gf_name or "（待定）"} - {gf_type or "（待定）"}
 【用户补充设定】
 {additional_info if additional_info else "（无）"}
-【题材参考】
-{genre_tropes[:1000] if genre_tropes else ""}
-{genre_template[:800] if genre_template else ""}"""
+{independent_stage_prompt if independent_stage_prompt else ""}
+【题材锁定】
+{genre_guard}
+【题材笔调校准】
+{positive_style_instruction}
+【子风格锁定】
+{substyle_instruction if substyle_instruction else "（无）"}
+【题材参考（仅限当前题材）】
+{trope_focus if trope_focus else ""}
+{style_guide if style_guide else ""}
+【子风格示例（按当前子风格抽取）】
+{substyle_examples if substyle_examples else ""}
+【题材示例（按当前题材动态加载）】
+{style_examples if style_examples else ""}
+要求：只学习句法与节奏，不照抄原句。
+{genre_template[:600] if genre_template else ""}"""
 
         # ========== 第1步：生成世界观 ==========
         yield {"type": "step", "step": "9a", "name": "AI 构思世界观", "status": "processing"}
@@ -1820,6 +2463,17 @@ class SkillExecutor:
 
             prompt = f"""请为《{title}》规划全书总纲（约600-1000章体量，分为12卷）。
 
+{independent_stage_prompt if independent_stage_prompt else ""}
+
+【题材锁定】
+{genre_guard}
+
+【题材笔调校准】
+{positive_style_instruction}
+
+【子风格锁定】
+{substyle_instruction if substyle_instruction else "（无）"}
+
 【设定参考】
 {world[:800]}
 {power[:500]}
@@ -1828,9 +2482,20 @@ class SkillExecutor:
 【用户补充设定】
 {additional_info if additional_info else "（无）"}
 
+【题材核心节奏】
+{trope_focus if trope_focus else "（无）"}
+{style_guide if style_guide else ""}
+
+【子风格示例（按当前子风格抽取）】
+{substyle_examples if substyle_examples else "（无）"}
+
+【题材示例（按当前题材动态加载）】
+{style_examples if style_examples else "（无）"}
+要求：学习风格而非复写句子。
+
 【要求】
 1. 每卷必须包含：标题、预计章数（如50-80章）、核心冲突、关键爽点、卷末高潮
-2. 节奏层层递进，符合{genre}爽文结构
+2. 节奏层层递进，符合{genre} / {effective_substyle} 的爽文结构
 3. 使用 Markdown 格式，每卷格式示例：
    ## 第X卷 《卷名》（约XX章）
    - **核心冲突**：...
@@ -1854,6 +2519,7 @@ class SkillExecutor:
                 yield {"type": "content", "chunk": chunk, "target": "total_outline"}
             
             (self.project_root / "大纲" / "总纲.md").write_text(outline_content, encoding="utf-8")
+            self._clear_outline_invalidation_state()
             yield {"type": "step", "step": 10, "name": "AI 规划全书总纲", "status": "completed"}
         except Exception as e:
             yield {"type": "step", "step": 10, "name": "AI 规划全书总纲", "status": "failed", "error": str(e)}
@@ -1871,7 +2537,7 @@ class SkillExecutor:
             chap1_dir.mkdir(exist_ok=True)
             chap1_path = chap1_dir / "第1章.md"
             if not chap1_path.exists():
-                chap1_path.write_text("# 第1章\n\n（开始您的创作...）", encoding="utf-8")
+                chap1_path.write_text("# 第1章\n", encoding="utf-8")
             
             yield {"type": "step", "step": 11, "name": "初始化章节结构", "status": "completed"}
         except Exception as e:
@@ -1882,6 +2548,7 @@ class SkillExecutor:
         self,
         title: str,
         genre: str,
+        substyle: str = "",
         protagonist_name: str = "",
         golden_finger_name: str = "",
         golden_finger_type: str = "",
@@ -1896,6 +2563,7 @@ class SkillExecutor:
         async for update_str in self.execute_init_stream(
             title=title,
             genre=genre,
+            substyle=substyle,
             protagonist_name=protagonist_name,
             golden_finger_name=golden_finger_name,
             golden_finger_type=golden_finger_type,
@@ -1925,6 +2593,17 @@ class SkillExecutor:
             project_info = state.get("project_info", {})
             title = project_info.get("title", "未命名项目")
             genre = project_info.get("genre", "修仙")
+            substyle = canonical_substyle_id(genre, project_info.get("substyle", state.get("substyle", "")))
+            style_bundle, normalized_genre, normalized_substyle = self._build_stage_style_bundle(
+                genre,
+                substyle,
+                stage="简介生成",
+                genre_style_chars=900,
+                genre_examples_chars=800,
+                substyle_examples_chars=700,
+            )
+            substyle_display = normalized_substyle or "默认子风格"
+            style_section = f"【当前阶段题材协议】\n{style_bundle}\n\n" if style_bundle else ""
             
             world = self._read_file(self.project_root / "设定集" / "世界观.md")
             char = self._read_file(self.project_root / "设定集" / "主角卡.md")
@@ -1936,10 +2615,10 @@ class SkillExecutor:
                 # 主角名以主角卡为准，同步到 state，避免后续链路读到脏值。
                 self._sync_protagonist_profile(protagonist_name)
             
-            prompt = f"""请为小说《{title}》写一份吸引人的小说简介（200-500字）。
+            prompt = f"""{style_section}请为小说《{title}》写一份吸引人的小说简介（200-500字）。
             
 【题材】
-{genre}
+{normalized_genre} / {substyle_display}
 
 【主角姓名（硬约束）】
 主角姓名必须是「{protagonist_name or "主角"}」。
@@ -1953,7 +2632,7 @@ class SkillExecutor:
 {outline[:2000]}
 
 【任务】
-1. 写一份简介，要求：钩子直接、文风符合{genre}、展现核心冲突或金手指爽点。
+1. 写一份简介，要求：钩子直接、文风严格符合上述题材/子风格创作协议、展现核心冲突或金手指爽点。
 2. 简介要能吸引读者产生阅读愿望。
 3. 请直接输出简介内容，不要带有"好的"、"这是简介"等废话。
 4. 简介中出现主角姓名时，必须严格使用「{protagonist_name or "主角"}」。"""
@@ -1969,7 +2648,7 @@ class SkillExecutor:
 
             # 兜底：若模型仍未使用正确主角名，进行一次低温修正规范化。
             if protagonist_name and protagonist_name not in synopsis:
-                fix_prompt = f"""请在不改变剧情信息与文风的前提下，修正下方简介中的主角姓名。
+                fix_prompt = f"""{style_section}请在不改变剧情信息与文风的前提下，修正下方简介中的主角姓名。
 要求：
 1. 主角姓名统一为「{protagonist_name}」。
 2. 删除/替换所有其他疑似主角名（如同音字、误写名）。
@@ -2007,15 +2686,26 @@ class SkillExecutor:
             state = self._load_state() or {}
             project_info = state.get("project_info", {})
             genre = project_info.get("genre", "修仙")
+            substyle = canonical_substyle_id(genre, project_info.get("substyle", state.get("substyle", "")))
+            style_bundle, normalized_genre, normalized_substyle = self._build_stage_style_bundle(
+                genre,
+                substyle,
+                stage="书名生成",
+                genre_style_chars=900,
+                genre_examples_chars=900,
+                substyle_examples_chars=700,
+            )
+            substyle_display = normalized_substyle or "默认子风格"
+            style_section = f"【当前阶段题材协议】\n{style_bundle}\n\n" if style_bundle else ""
             
             world = self._read_file(self.project_root / "设定集" / "世界观.md")
             char = self._read_file(self.project_root / "设定集" / "主角卡.md")
             outline = self._read_file(self.project_root / "大纲" / "总纲.md")
             
-            prompt = f"""请为一部{genre}题材的小说起10个吸引人的书名。
+            prompt = f"""{style_section}请为一部{normalized_genre}题材、子风格为{substyle_display}的小说起10个吸引人的书名。
             
 【题材】
-{genre}
+{normalized_genre} / {substyle_display}
 
 【现有设定参考】
 {world[:600] if world else "（暂无详细世界观）"}
@@ -2025,7 +2715,7 @@ class SkillExecutor:
 {outline[:1000] if outline else "（暂无详细大纲）"}
 
 【要求】
-1. 书名要符合当前{genre}市场流行趋势。
+1. 书名要严格符合上述题材/子风格创作协议和当前市场感受。
 2. 风格多样化：有的霸气、有的文艺、有的直白（如：书名中包含金手指）。
 3. 每一个书名后面必须附带简短的推荐理由（解析亮点）。
 4. 格式严格要求：书名 | 推荐理由
@@ -2065,6 +2755,164 @@ class SkillExecutor:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    async def execute_generate_ending_plan(self, remaining_chapters: int = 5) -> Dict[str, Any]:
+        """生成收尾规划，统一走题材/子风格 stage prompt 体系。"""
+        if not self.ai_service:
+            return {"success": False, "error": "AI Service not configured"}
+
+        remaining = max(1, int(remaining_chapters or 1))
+
+        try:
+            state = self._load_state() or {}
+            project_info = state.get("project_info", {}) if isinstance(state.get("project_info"), dict) else {}
+            title = self._safe_text(project_info.get("title", "未命名项目")).strip() or "未命名项目"
+            style_bundle, normalized_genre, normalized_substyle = self._build_project_stage_style_bundle(
+                stage="收尾规划",
+                genre_style_chars=1200,
+                genre_examples_chars=1000,
+                substyle_examples_chars=800,
+            )
+            substyle_display = normalized_substyle or "默认子风格"
+            style_section = f"【当前阶段题材协议】\n{style_bundle}\n\n" if style_bundle else ""
+
+            outline = self._read_file(self.project_root / "大纲" / "总纲.md")
+            outline_for_prompt = self._compress_outline_for_prompt(outline, 12000) if outline else "（无）"
+            protagonist_card = self._truncate_text(
+                self._read_file(self.project_root / "设定集" / "主角卡.md"),
+                2400,
+                keep_tail=False,
+            ) or "（无）"
+            realtime_status = self._truncate_text(
+                self._read_file(self.project_root / "设定集" / "实时状态.md"),
+                2600,
+                keep_tail=True,
+            ) or "（无）"
+
+            chapters_dir = self.project_root / "正文"
+            chapter_files = sorted(chapters_dir.glob("第*章*.md")) if chapters_dir.exists() else []
+            completed_chapters = len(chapter_files)
+            last_chapter_num = 0
+            last_chapter_name = ""
+            for path in chapter_files:
+                match = re.search(r"第0*(\d+)章", path.stem)
+                if not match:
+                    continue
+                try:
+                    last_chapter_num = max(last_chapter_num, int(match.group(1)))
+                except ValueError:
+                    continue
+            if not last_chapter_num:
+                try:
+                    last_chapter_num = int(state.get("current_chapter", 0) or 0)
+                except Exception:
+                    last_chapter_num = 0
+            if chapter_files:
+                last_chapter_name = chapter_files[-1].stem
+            next_chapter_num = max(1, last_chapter_num + 1)
+
+            continuity_summary = ""
+            if last_chapter_num > 0:
+                continuity_summary = self._read_file(
+                    self.project_root / "正文" / ".continuity" / f"第{last_chapter_num}章_状态.md"
+                )
+            continuity_for_prompt = self._truncate_text(
+                continuity_summary,
+                1800,
+                keep_tail=True,
+            ) if continuity_summary else "（无）"
+
+            current_progress_lines = [
+                f"- 已完成章节数：{completed_chapters}",
+                f"- 当前已写到：第{last_chapter_num}章" if last_chapter_num else "- 当前已写到：尚未开始正文",
+                f"- 最新章节文件：{last_chapter_name or '（无）'}",
+                f"- 后续规划起始章节号：第{next_chapter_num}章",
+                f"- 本次需要规划章数：{remaining}",
+            ]
+            current_progress = "\n".join(current_progress_lines)
+
+            prompt = f"""{style_section}你是资深网文完结策划主编。请为小说《{title}》规划最后 {remaining} 章的收尾大纲。
+
+【题材】
+{normalized_genre} / {substyle_display}
+
+【当前进度】
+{current_progress}
+
+【主角卡摘要】
+{protagonist_card}
+
+【实时状态摘要】
+{realtime_status}
+
+【最近连续性摘要】
+{continuity_for_prompt}
+
+【总纲】
+{outline_for_prompt}
+
+【任务】
+1. 严格遵守上述题材/子风格创作协议，给出符合当前题材兑现方式的收尾方案。
+2. 必须回收关键伏笔，保证节奏递进，并让结局与既有设定、总纲、主角状态一致。
+3. 章节号必须从第{next_chapter_num}章开始连续编号，共 {remaining} 章。
+4. 每章都要写清楚：章节号、标题、剧情概要、本章核心作用。
+5. 只输出合法 JSON，不要 Markdown 代码块，不要解释。
+
+【JSON 输出格式】
+{{
+  "ending_strategy": "收尾策略简述（200字内）",
+  "ending_straregy": "同 ending_strategy，兼容旧前端字段",
+  "chapters": [
+    {{
+      "chapter_num": {next_chapter_num},
+      "title": "章节标题",
+      "summary": "章节剧情概要（100字+）",
+      "purpose": "本章核心作用"
+    }}
+  ]
+}}"""
+
+            data = await self._chat_json_with_retry(
+                prompt,
+                temperature=0.5,
+                max_tokens=4200,
+                retries=2,
+            )
+            if not data:
+                return {"success": False, "error": "AI 规划失败: 未返回可解析 JSON"}
+
+            strategy = self._safe_text(data.get("ending_strategy", data.get("ending_straregy", ""))).strip()
+            if strategy:
+                data["ending_strategy"] = strategy
+                data["ending_straregy"] = strategy
+
+            chapters = data.get("chapters", [])
+            if not isinstance(chapters, list):
+                chapters = []
+
+            normalized_chapters: List[Dict[str, Any]] = []
+            for idx, item in enumerate(chapters[:remaining], start=next_chapter_num):
+                if not isinstance(item, dict):
+                    continue
+                chapter_num = item.get("chapter_num", idx)
+                try:
+                    chapter_num = int(str(chapter_num).strip())
+                except Exception:
+                    chapter_num = idx
+                normalized_chapters.append(
+                    {
+                        "chapter_num": chapter_num,
+                        "title": self._safe_text(item.get("title", "")).strip(),
+                        "summary": self._safe_text(item.get("summary", "")).strip(),
+                        "purpose": self._safe_text(item.get("purpose", "")).strip(),
+                    }
+                )
+            if not normalized_chapters:
+                return {"success": False, "error": "AI 规划失败: 未生成可用章节列表"}
+            data["chapters"] = normalized_chapters
+            return {"success": True, "plan": data}
+        except Exception as e:
+            return {"success": False, "error": f"AI 规划失败: {str(e)}"}
+
     def _save_state(self, state: Dict):
         """保存 state.json"""
         state_file = self.webnovel_dir / "state.json"
@@ -2097,6 +2945,8 @@ class SkillExecutor:
             state = self._load_state() or {}
             project_info = state.get("project_info", {})
             title = project_info.get("title", "未命名项目")
+            genre = project_info.get("genre", state.get("genre", "修仙"))
+            substyle = canonical_substyle_id(genre, project_info.get("substyle", state.get("substyle", "")))
             
             world = self._read_file(self.project_root / "设定集" / "世界观.md")
             power = self._read_file(self.project_root / "设定集" / "力量体系.md")
@@ -2118,7 +2968,18 @@ class SkillExecutor:
             char_for_prompt = self._truncate_text(char, budgets.get("char", 1200), keep_tail=False)
             gold_finger_for_prompt = self._truncate_text(gold_finger, budgets.get("gold_finger", 1400), keep_tail=False)
             entity_for_prompt = self._truncate_text(entity_libraries, budgets.get("entity_libraries", 1400), keep_tail=False)
-            trope_for_prompt = self._truncate_text(genre_tropes, budgets.get("genre_tropes", 1200), keep_tail=False)
+            trope_for_prompt = self._load_genre_trope_focus(genre, genre_tropes, budgets.get("genre_tropes", 1200))
+            style_for_prompt = self._load_genre_style_guide(genre, max_chars=1800)
+            independent_stage_prompt = self._build_independent_stage_prompt_block(
+                genre,
+                substyle,
+                stage="总纲重写",
+            )
+            substyle_instruction = self._build_substyle_instruction(genre, substyle, stage="总纲重写")
+            substyle_examples = self._load_substyle_examples(genre, substyle, max_chars=budgets.get("genre_examples", 700))
+            example_for_prompt = self._load_genre_style_examples(genre, substyle, max_chars=budgets.get("genre_examples", 900))
+            genre_guard = self._build_genre_guard_instruction(genre, stage="总纲重写")
+            positive_style_instruction = self._build_genre_positive_style_instruction(genre, stage="总纲重写")
             guidance_for_prompt = self._truncate_text(guidance, budgets.get("guidance", 1600), keep_tail=False)
             outline_for_prompt = self._compress_outline_for_prompt(
                 current_outline,
@@ -2126,6 +2987,20 @@ class SkillExecutor:
             )
 
             prompt = f"""请为《{title}》重新规划全书总纲。
+
+【题材】
+{genre} / {substyle}
+
+{independent_stage_prompt if independent_stage_prompt else ""}
+
+【题材锁定】
+{genre_guard}
+
+【题材笔调校准】
+{positive_style_instruction}
+
+【子风格锁定】
+{substyle_instruction if substyle_instruction else "（无）"}
 
 【用户指导意见】
 {guidance_for_prompt}
@@ -2139,6 +3014,12 @@ class SkillExecutor:
 
 【参考：题材核心节奏】
 {trope_for_prompt}
+{style_for_prompt}
+【参考：子风格示例（按当前子风格抽取）】
+{substyle_examples if substyle_examples else "（无）"}
+【参考：题材表达示例（按当前题材动态加载）】
+{example_for_prompt if example_for_prompt else "（无）"}
+要求：学习风格而非复写句子。
 
 【当前文稿】
 {outline_for_prompt}
@@ -2164,11 +3045,20 @@ class SkillExecutor:
 
 请输出完整的 Markdown 内容："""
 
+            # 动态计算 max_tokens：根据目标章节数估算
+            # 假设平均每卷 50 章，每卷摘要约 150 tokens
+            # 对于 1200 章的小说（约 12 卷），需要约 12 * 150 = 1800 tokens
+            # 加上格式和说明，设置为 12000 确保完整
+            state = self._load_state() or {}
+            target_chapters = state.get("project_info", {}).get("target_chapters", 600)
+            estimated_volumes = max(1, (target_chapters + 49) // 50)  # 向上取整
+            dynamic_max_tokens = max(6000, estimated_volumes * 200 + 2000)
+
             full_content = ""
             async for chunk in self.ai_service.chat_stream(
                 [{"role": "user", "content": prompt}],
                 temperature=0.7,
-                max_tokens=6000
+                max_tokens=dynamic_max_tokens
             ):
                 if not chunk:
                     continue
@@ -2179,6 +3069,7 @@ class SkillExecutor:
                 yield make_event("content", chunk=chunk)
 
             (self.project_root / "大纲" / "总纲.md").write_text(full_content, encoding="utf-8")
+            self._clear_outline_invalidation_state()
             yield make_event("step", name="AI 规划总纲", status="completed")
             yield make_event("done", success=True, message="总纲规划完成")
 
@@ -2203,6 +3094,14 @@ class SkillExecutor:
         """流式执行 webnovel-plan Skill 完整工作流"""
         def make_event(type, **kwargs):
             return json.dumps({"type": type, **kwargs}, ensure_ascii=False)
+
+        invalidation_reason = self._get_outline_invalidation_reason()
+        if invalidation_reason and volume > 0:
+            yield make_event(
+                "error",
+                message=f"{invalidation_reason} 请先重新生成总纲，再规划分卷大纲。",
+            )
+            return
 
         # Step 1-3: 加载各类指南和套路
         yield make_event("step", name="加载规划指南与题材套路", status="processing")
@@ -2233,6 +3132,10 @@ class SkillExecutor:
         yield make_event("step", name="AI 规划详细大纲", status="processing")
         if self.ai_service:
             genre = state.get("project_info", {}).get("genre", "修仙") if state else "修仙"
+            substyle = canonical_substyle_id(
+                genre,
+                state.get("project_info", {}).get("substyle", state.get("substyle", "")) if state else "",
+            )
             title = state.get("project_info", {}).get("title", "未命名") if state else "未命名"
             
             # 加载设定集作为参考
@@ -2299,7 +3202,18 @@ class SkillExecutor:
             entity_for_prompt = self._truncate_text(entity_libraries, budgets.get("entity_libraries", 1400), keep_tail=False)
             chapter_planning_for_prompt = self._truncate_text(chapter_planning, budgets.get("chapter_planning", 1200), keep_tail=False)
             conflict_design_for_prompt = self._truncate_text(conflict_design, budgets.get("conflict_design", 1000), keep_tail=False)
-            trope_for_prompt = self._truncate_text(genre_tropes, budgets.get("genre_tropes", 1000), keep_tail=False)
+            trope_for_prompt = self._load_genre_trope_focus(genre, genre_tropes, budgets.get("genre_tropes", 1000))
+            style_for_prompt = self._load_genre_style_guide(genre, max_chars=1600)
+            independent_stage_prompt = self._build_independent_stage_prompt_block(
+                genre,
+                substyle,
+                stage="分卷大纲",
+            )
+            substyle_instruction = self._build_substyle_instruction(genre, substyle, stage="分卷大纲")
+            substyle_examples = self._load_substyle_examples(genre, substyle, max_chars=budgets.get("genre_examples", 700))
+            example_for_prompt = self._load_genre_style_examples(genre, substyle, max_chars=budgets.get("genre_examples", 900))
+            genre_guard = self._build_genre_guard_instruction(genre, stage="分卷大纲")
+            positive_style_instruction = self._build_genre_positive_style_instruction(genre, stage="分卷大纲")
             
             # 构建上一卷上下文摘要（取最后1500字，包含结尾剧情）
             prev_vol_context = ""
@@ -2309,6 +3223,12 @@ class SkillExecutor:
 
 ⚠️ **衔接要求**：新卷第一章必须自然承接上一卷结尾的剧情走向，不能突然跳转或割裂！
 """
+
+            opening_rule = (
+                "2. **新卷第一章必须衔接上一卷结尾**，不能突然跳场景或时间跳跃！"
+                if volume > 1
+                else '2. **第1卷第1章必须作为全书开篇起笔**，禁止出现"承接上卷/承接开篇结尾/接上回"等表述。'
+            )
             
             # 读取当前活跃角色表
             character_roster = ""
@@ -2333,6 +3253,18 @@ class SkillExecutor:
 【小说信息】
 - 书名：《{title}》
 - 题材：{genre}
+- 子风格：{substyle}
+
+{independent_stage_prompt if independent_stage_prompt else ""}
+
+【题材锁定】
+{genre_guard}
+
+【题材笔调校准】
+{positive_style_instruction}
+
+【子风格锁定】
+{substyle_instruction if substyle_instruction else "（无）"}
 
 {prev_vol_context}
 
@@ -2360,10 +3292,16 @@ class SkillExecutor:
 {chapter_planning_for_prompt if chapter_planning_for_prompt else ""}
 {conflict_design_for_prompt if conflict_design_for_prompt else ""}
 {trope_for_prompt if trope_for_prompt else ""}
+{style_for_prompt if style_for_prompt else ""}
+【子风格示例（按当前子风格抽取）】
+{substyle_examples if substyle_examples else "（无）"}
+【题材示例（按当前题材动态加载）】
+{example_for_prompt if example_for_prompt else "（无）"}
+要求：学习表达风格，不照抄句子。
 
 【输出要求】
 1. 第一行必须是卷标题，格式：# 第 {volume} 卷：【卷名】（第 {start_chapter}-{end_chapter} 章）
-2. **新卷第一章必须衔接上一卷结尾**，不能突然跳场景或时间跳跃！
+{opening_rule}
 3. 必须严格遵循上方总纲摘要中的剧情走向和爽点
 4. 生成第 {start_chapter} 章到第 {end_chapter} 章，共 {chapters_count} 章的详细大纲
 5. 章节编号必须从 {start_chapter} 开始，依次递增！
@@ -2383,6 +3321,10 @@ class SkillExecutor:
    - "死伤惨重"（太模糊！必须写具体数字）
    - "消耗了大量资源"（必须说明消耗了什么、多少）"""
 
+            # 动态计算 max_tokens：基础 2000 + 每章 250 tokens
+            # 60章需要约 17000 tokens，确保不会被截断
+            dynamic_max_tokens = max(8000, 2000 + chapters_count * 250)
+
             full_content = ""
             async for chunk in self.ai_service.chat_stream(
                 [
@@ -2390,7 +3332,7 @@ class SkillExecutor:
                     {"role": "user", "content": f"请详细规划第 {volume} 卷的 {chapters_count} 章大纲"}
                 ],
                 temperature=0.7,
-                max_tokens=8000
+                max_tokens=dynamic_max_tokens
             ):
                 if not chunk:
                     continue
@@ -2451,6 +3393,27 @@ class SkillExecutor:
         budgets = self._get_context_budgets("outline_polish")
         content_for_prompt = self._compress_outline_for_prompt(content, budgets.get("content", 12000))
         requirements_for_prompt = self._truncate_text(requirements, budgets.get("requirements", 1800), keep_tail=False)
+        genre = self._get_project_genre()
+        substyle = self._get_project_substyle()
+        independent_stage_prompt = self._build_independent_stage_prompt_block(
+            genre,
+            substyle,
+            stage="大纲润色",
+        )
+        genre_guard = self._build_genre_guard_instruction(genre, stage="大纲润色")
+        positive_style_instruction = self._build_genre_positive_style_instruction(genre, stage="大纲润色")
+        substyle_instruction = self._build_substyle_instruction(genre, substyle, stage="大纲润色")
+        style_for_prompt = self._load_genre_style_guide(genre, max_chars=1800)
+        substyle_examples_for_prompt = self._load_substyle_examples(
+            genre,
+            substyle,
+            max_chars=budgets.get("genre_examples", 700),
+        )
+        style_examples_for_prompt = self._load_genre_style_examples(
+            genre,
+            substyle,
+            max_chars=budgets.get("genre_examples", 900),
+        )
         
         system_prompt = """你是一位专业的网文大纲医生。请根据用户的修改要求，对已有的大纲进行润色和优化。
         
@@ -2468,6 +3431,25 @@ class SkillExecutor:
         - 【伤亡】xxx (如：死士阵亡500人)
         - 【消耗】xxx (如：气运消耗200点)
         - 【状态】xxx (如：重伤、突破)
+
+        """ + (independent_stage_prompt + "\n\n" if independent_stage_prompt else "") + """
+
+        【题材锁定（最高优先级）】
+        当前题材：""" + genre + """
+        """ + genre_guard + """
+        """ + positive_style_instruction + """
+        """ + substyle_instruction + """
+        若修改要求未明确要求跨题材试验，文风必须严格锁定在当前题材范式内。
+
+        【题材风格参考】
+        """ + (style_for_prompt if style_for_prompt else "（无）") + """
+
+        【子风格示例（按当前子风格抽取）】
+        """ + (substyle_examples_for_prompt if substyle_examples_for_prompt else "（无）") + """
+
+        【题材示例（按当前题材动态加载）】
+        """ + (style_examples_for_prompt if style_examples_for_prompt else "（无）") + """
+        要求：只学习语气与节奏，不照抄原句。
         """
         
         user_prompt = f"""【已有大纲】
@@ -2524,17 +3506,24 @@ class SkillExecutor:
         self._debug(f"[DEBUG] 正文目录: {self.project_root / '正文'}")
         self._debug(f"{'=' * 60}")
 
+        invalidation_reason = self._get_outline_invalidation_reason()
+        if invalidation_reason:
+            yield make_event(
+                "error",
+                message=f"{invalidation_reason} 请先重新生成总纲/卷纲，再继续写作。",
+            )
+            return
+
         # Step 1: Context Agent 搜集上下文
         yield make_event("step", name="Context Agent 搜集上下文", status="processing")
         context_pack = await self._execute_context_agent(chapter)
         yield make_event("step", name="Context Agent 搜集上下文", status="completed")
 
-        # Step 1.5: 加载核心约束与场景参考
-        yield make_event("step", name="加载写作约束与参考", status="processing")
+        # Step 1.5: 加载核心约束
+        yield make_event("step", name="加载写作约束", status="processing")
         core_constraints = self._load_reference("webnovel-write", "core-constraints.md")
         chapter_outline = context_pack.get("core", {}).get("chapter_outline", "")
-        scene_refs = self._load_scene_references(chapter_outline)
-        yield make_event("step", name="加载写作约束与参考", status="completed")
+        yield make_event("step", name="加载写作约束", status="completed")
 
         # 结构兜底：未命中本章大纲时直接中断，避免脱纲创作
         if not chapter_outline or chapter_outline.strip() in {f"第{chapter}章"}:
@@ -2549,7 +3538,7 @@ class SkillExecutor:
                 # 这里我们直接手动实现流式逻辑以获得更好的控制
                 full_content = ""
                 async for chunk in self._generate_chapter_content_stream(
-                    chapter, context_pack, core_constraints, scene_refs, word_count
+                    chapter, context_pack, core_constraints, word_count
                 ):
                     if not chunk:
                         continue
@@ -2597,6 +3586,30 @@ class SkillExecutor:
                 if removed_count > 0:
                     self._debug(f"[WRITE-SANITIZE DEBUG] 第{chapter}章清理记录标签 {removed_count} 处")
                 yield make_event("step", name="正文展示清洗", status="completed")
+
+                # Step 2.7: 结尾完整性修复（防半句截断）
+                yield make_event("step", name="结尾完整性检查", status="processing")
+                try:
+                    if self._has_abrupt_tail(full_content):
+                        repaired = await self._repair_abrupt_tail(
+                            chapter=chapter,
+                            genre=self._get_project_genre(),
+                            chapter_outline=chapter_outline,
+                            content=full_content,
+                        )
+                        repaired, repaired_report = self._sanitize_reader_facing_content(repaired)
+                        repaired_removed = int(repaired_report.get("removed_lines", 0)) + int(
+                            repaired_report.get("removed_inline_tags", 0)
+                        )
+                        if repaired_removed > 0:
+                            self._debug(f"[TAIL-REPAIR SANITIZE] 第{chapter}章清理记录标签 {repaired_removed} 处")
+                        if repaired and repaired != full_content:
+                            full_content = repaired
+                            yield make_event("content", chunk="", full=full_content, replace=True)
+                except Exception as tail_err:
+                    print(f"[TAIL-REPAIR ERROR] {tail_err}")
+                    yield make_event("error", message=f"结尾完整性修复失败: {tail_err}", level="warning")
+                yield make_event("step", name="结尾完整性检查", status="completed")
                 
                 # Step 3 & 4 (简化处理)
                 yield make_event("step", name="AI 质量审查", status="processing")
@@ -2617,55 +3630,8 @@ class SkillExecutor:
                 yield make_event("step", name="等待保存后更新角色状态", status="processing")
                 yield make_event("step", name="等待保存后更新角色状态", status="completed")
                 
-                # 自动索引新章节到 RAG 数据库
-                rag = None
-                try:
-                    yield make_event("step", name="更新 RAG 索引", status="processing")
-                    from data_modules.rag_adapter import RAGAdapter
-                    from data_modules.config import DataModulesConfig
-                    rag_config = DataModulesConfig.from_project_root(self.project_root)
-                    rag = RAGAdapter(rag_config)
-                    
-                    # 构建按场景切分的 chunks，避免 scene_index 恒为 1
-                    scene_chunks = self._split_content_for_rag(full_content, chunk_size=1800, overlap=220)
-                    chunks = [
-                        {
-                            "chapter": chapter,
-                            "scene_index": item.get("scene_index", idx + 1),
-                            "content": item.get("content", ""),
-                        }
-                        for idx, item in enumerate(scene_chunks)
-                        if self._safe_text(item.get("content", "")).strip()
-                    ]
-                    await rag.store_chunks(chunks)
-                    yield make_event("step", name="更新 RAG 索引", status="completed")
-                except Exception as e:
-                    print(f"[RAG Index Error] {e}")
-                    yield make_event("error", message=f"索引失败: {str(e)}", level="warning")
-                finally:
-                    try:
-                        if rag and getattr(rag, "api_client", None):
-                            close_fn = getattr(rag.api_client, "close", None)
-                            if close_fn:
-                                await close_fn()
-                    except Exception as close_err:
-                        print(f"[RAG Index Error] Failed to close client session: {close_err}")
-                
-                # 生成连续性摘要（供下一章参考）
-                try:
-                    yield make_event("step", name="生成连续性摘要", status="processing")
-                    continuity_summary = await self._generate_continuity_summary(chapter, full_content)
-                    if continuity_summary:
-                        # 保存到文件
-                        continuity_dir = self.project_root / "正文" / ".continuity"
-                        continuity_dir.mkdir(parents=True, exist_ok=True)
-                        continuity_file = continuity_dir / f"第{chapter}章_状态.md"
-                        continuity_file.write_text(continuity_summary, encoding="utf-8")
-                    yield make_event("step", name="生成连续性摘要", status="completed")
-                except Exception as e:
-                    print(f"[Continuity Summary Error] {e}")
-                
-                # 注意：世界观提取已移至手动保存时触发，避免重复分析
+                # 注意：RAG 索引、连续性摘要、角色状态抽取都在用户手动保存后触发，
+                # 避免"未采纳草稿"污染持久化数据。
                 
                 yield make_event("done", success=True, content=full_content)
             except Exception as e:
@@ -2708,15 +3674,40 @@ class SkillExecutor:
              removed_count = int(sanitize_report.get("removed_lines", 0)) + int(sanitize_report.get("removed_inline_tags", 0))
              if removed_count > 0:
                  self._debug(f"[POLISH-SANITIZE DEBUG] 清理记录标签 {removed_count} 处")
+
+             genre = self._get_project_genre()
+             chapter_outline = self._find_chapter_outline(chapter_id)
+             tail_fix_applied = False
+             if self._has_abrupt_tail(polished_content):
+                 repaired = await self._repair_abrupt_tail(
+                     chapter=chapter_id,
+                     genre=genre,
+                     chapter_outline=chapter_outline,
+                     content=polished_content,
+                 )
+                 repaired, tail_sanitize_report = self._sanitize_reader_facing_content(repaired)
+                 tail_removed = int(tail_sanitize_report.get("removed_lines", 0)) + int(
+                     tail_sanitize_report.get("removed_inline_tags", 0)
+                 )
+                 if tail_removed > 0:
+                     self._debug(f"[POLISH-TAIL-SANITIZE DEBUG] 清理记录标签 {tail_removed} 处")
+                 if repaired and repaired != polished_content:
+                     polished_content = repaired
+                     tail_fix_applied = True
+
              self._debug(f"[DEBUG] execute_polish: AI输出长度={len(polished_content) if polished_content else 0}")
              self._debug(f"[DEBUG] execute_polish: AI输出前200字={polished_content[:200] if polished_content else '(空)'}")
-             return {"success": True, "content": polished_content}
+             return {
+                 "success": True,
+                 "content": polished_content,
+                 "tail_fix_applied": tail_fix_applied,
+             }
         except Exception as e:
              self._debug(f"[DEBUG] execute_polish: 异常={str(e)}")
              return {"success": False, "error": str(e)}
 
     async def execute_polish_stream(self, chapter_id: int, content: str, suggestions: str):
-        """执行润色工作流（流式输出），完成后触发 RAG 索引 + 连续性摘要更新"""
+        """执行润色工作流（流式输出）。持久化副作用统一在手动保存后触发。"""
         def make_event(type, **kwargs):
             return json.dumps({"type": type, **kwargs}, ensure_ascii=False)
 
@@ -2747,57 +3738,33 @@ class SkillExecutor:
              removed_count = int(sanitize_report.get("removed_lines", 0)) + int(sanitize_report.get("removed_inline_tags", 0))
              if removed_count > 0:
                  self._debug(f"[POLISH-SANITIZE DEBUG] 清理记录标签 {removed_count} 处")
-             yield make_event("content", chunk="", full=full_content)  # ensure frontend has full text
              yield make_event("step", name="AI 正在思考润色方案...", status="completed")
 
-             # ===== 后处理：与写作流程一致 =====
-
-             # 更新 RAG 索引
-             rag = None
+             genre = self._get_project_genre()
+             chapter_outline = self._find_chapter_outline(chapter_id)
+             yield make_event("step", name="结尾完整性检查", status="processing")
              try:
-                 yield make_event("step", name="更新 RAG 索引", status="processing")
-                 from data_modules.rag_adapter import RAGAdapter
-                 from data_modules.config import DataModulesConfig
-                 rag_config = DataModulesConfig.from_project_root(self.project_root)
-                 rag = RAGAdapter(rag_config)
+                 if self._has_abrupt_tail(full_content):
+                     repaired = await self._repair_abrupt_tail(
+                         chapter=chapter_id,
+                         genre=genre,
+                         chapter_outline=chapter_outline,
+                         content=full_content,
+                     )
+                     repaired, tail_sanitize_report = self._sanitize_reader_facing_content(repaired)
+                     tail_removed = int(tail_sanitize_report.get("removed_lines", 0)) + int(
+                         tail_sanitize_report.get("removed_inline_tags", 0)
+                     )
+                     if tail_removed > 0:
+                         self._debug(f"[POLISH-TAIL-SANITIZE DEBUG] 清理记录标签 {tail_removed} 处")
+                     if repaired and repaired != full_content:
+                         full_content = repaired
+                         yield make_event("content", chunk="", full=full_content, replace=True)
+             except Exception as tail_err:
+                 yield make_event("error", message=f"结尾完整性修复失败: {tail_err}", level="warning")
+             yield make_event("step", name="结尾完整性检查", status="completed")
 
-                 scene_chunks = self._split_content_for_rag(full_content, chunk_size=1800, overlap=220)
-                 chunks = [
-                     {
-                         "chapter": chapter_id,
-                         "scene_index": item.get("scene_index", idx + 1),
-                         "content": item.get("content", ""),
-                     }
-                     for idx, item in enumerate(scene_chunks)
-                     if self._safe_text(item.get("content", "")).strip()
-                 ]
-                 await rag.store_chunks(chunks)
-                 yield make_event("step", name="更新 RAG 索引", status="completed")
-             except Exception as e:
-                 print(f"[POLISH-RAG Error] {e}")
-                 yield make_event("step", name="更新 RAG 索引", status="completed")
-             finally:
-                 try:
-                     if rag and getattr(rag, "api_client", None):
-                         close_fn = getattr(rag.api_client, "close", None)
-                         if close_fn:
-                             await close_fn()
-                 except Exception as close_err:
-                     print(f"[POLISH-RAG Error] Failed to close client session: {close_err}")
-
-             # 生成连续性摘要
-             try:
-                 yield make_event("step", name="生成连续性摘要", status="processing")
-                 continuity_summary = await self._generate_continuity_summary(chapter_id, full_content)
-                 if continuity_summary:
-                     continuity_dir = self.project_root / "正文" / ".continuity"
-                     continuity_dir.mkdir(parents=True, exist_ok=True)
-                     continuity_file = continuity_dir / f"第{chapter_id}章_状态.md"
-                     continuity_file.write_text(continuity_summary, encoding="utf-8")
-                 yield make_event("step", name="生成连续性摘要", status="completed")
-             except Exception as e:
-                 print(f"[POLISH-Continuity Error] {e}")
-                 yield make_event("step", name="生成连续性摘要", status="completed")
+             yield make_event("content", chunk="", full=full_content, replace=True)  # ensure frontend has full text
 
              yield make_event("done")
 
@@ -2808,6 +3775,7 @@ class SkillExecutor:
         """执行审查工作流 (使用 review.md Skill)"""
         review_budget = self._get_context_budgets("review")
         content = self._safe_text(content)
+        genre = self._get_project_genre()
 
         # 1. 准备上下文
         chapter_outline = self._find_chapter_outline(chapter_id)
@@ -2833,16 +3801,12 @@ class SkillExecutor:
             pass
 
         # 2. 加载 Prompt 和参考资料
-        review_prompt_tmpl = self._load_reference("webnovel-write", "prompts/review.md")
-        core_constraints = self._load_reference("webnovel-write", "references/core-constraints.md") or ""
+        review_prompt_tmpl = self._load_project_prompt("review", genre=genre)
+        core_constraints = self._load_reference("webnovel-write", "core-constraints.md") or ""
         
         # 加载 webnovel-review skill 中的参考文件
-        common_mistakes = self._load_reference("webnovel-review", "references/common-mistakes.md") or ""
-        cool_points = self._load_reference("webnovel-review", "references/cool-points-guide.md") or ""
-        
-        if not review_prompt_tmpl:
-             # Fallback if file not found
-             review_prompt_tmpl = "请审查以下内容，检查剧情一致性和文笔问题。\n{core_constraints}"
+        common_mistakes = self._load_reference("webnovel-review", "common-mistakes.md") or ""
+        cool_points = self._load_reference("webnovel-review", "cool-points-guide.md") or ""
 
         # 填空
         try:
@@ -2906,11 +3870,28 @@ class SkillExecutor:
             review_budget.get("content", 9000),
             keep_tail=True,
         )
-        
+        should_block_weird_terms = self._should_block_weird_style_terms(
+            genre,
+            chapter_outline,
+            worldview,
+            gold_finger,
+        )
+
         # 4. 组装 User Content
-        user_content = f"请审查第 {chapter_id} 章：\n\n"
+        user_content = f"请审查第 {chapter_id} 章（当前题材：{genre}）：\n\n"
         if chapter_outline_for_review:
             user_content += f"【本章大纲（必须严格一致）】\n{chapter_outline_for_review}\n\n"
+        if should_block_weird_terms:
+            user_content += """【风格跑偏重点检查】
+本书当前不是规则怪谈/诡异流。若正文出现明显怪谈母题（如守则闯关、SAN值、污染传播、诡域副本等），请明确标记为"风格跑偏"。\n\n"""
+        if self._normalize_genre_key(genre) == "xuanhuan":
+            user_content += """【玄幻笔调重点检查】
+若正文整体阅读体验是"压抑求生/潜伏惊悚"，而非"修炼成长/资源争夺/反制上位"，请明确标记为"玄幻笔调不足"。\n\n"""
+            protagonist_expected = self._normalize_entity_name((self._load_state() or {}).get("protagonist_state", {}).get("name", ""))
+            protagonist_expected = re.sub(r"^\*+|\*+$", "", protagonist_expected).strip()
+            if protagonist_expected:
+                user_content += f"""【主角名一致性检查】
+当前项目主角名应为：{protagonist_expected}。若正文主角核心称呼长期不一致，请标记为"主角命名漂移"。\n\n"""
         
         if previous_ending_for_review:
             user_content += f"【上一章结尾（用于检查角色状态连续性）】\n{previous_ending_for_review}\n\n"
@@ -3010,17 +3991,27 @@ class SkillExecutor:
             return {"success": False, "error": "AI Service not initialized"}
             
         # 1. 读取 prompt 模板
-        prompt_path = SKILLS_DIR / "webnovel-write" / "prompts" / "extract_state.md"
-        if not prompt_path.exists():
-            return {"success": False, "error": "extract_state.md not found"}
-            
-        tmpl = prompt_path.read_text(encoding="utf-8")
+        tmpl = self._load_project_prompt("extract_state")
         
         # 2. 准备上下文 (核心约束/存量设定)
         state_data = self._load_state() or {}
         core_constraints = state_data.get("core_settings", "无")
+        style_bundle, normalized_genre, normalized_substyle = self._build_project_stage_style_bundle(
+            stage="状态抽取",
+            genre_style_chars=500,
+            genre_examples_chars=0,
+            substyle_examples_chars=0,
+        )
+        substyle_display = normalized_substyle or "默认子风格"
+        style_section = (
+            f"\n\n【当前阶段题材协议】\n{style_bundle}\n\n【题材】\n{normalized_genre} / {substyle_display}\n"
+            if style_bundle
+            else ""
+        )
         
-        system_prompt = tmpl.replace("{core_constraints}", str(core_constraints)).replace("{content}", content)
+        system_prompt = (
+            tmpl.replace("{core_constraints}", str(core_constraints)).replace("{content}", content) + style_section
+        )
         
         # 3. 请求 AI (要求 JSON 格式)
         messages = [
@@ -3153,6 +4144,13 @@ class SkillExecutor:
                         protagonist_info["personality"] = personality_match.group(1).strip()
             
             context_pack["core"]["protagonist_snapshot"] = protagonist_info
+            current_genre = self._get_project_genre()
+            current_substyle = self._get_project_substyle()
+            context_pack["global"]["genre"] = current_genre
+            context_pack["global"]["substyle"] = current_substyle
+            genre_style_guide = self._load_genre_style_guide(current_genre, max_chars=3600)
+            if genre_style_guide:
+                context_pack["global"]["genre_style_guide"] = genre_style_guide
 
             # Step 2.5: 读取活跃角色表
             character_roster = ""
@@ -3202,32 +4200,8 @@ class SkillExecutor:
                 if continuity_file.exists():
                     context_pack["core"]["continuity_summary"] = self._read_file(continuity_file)
 
-            # Step 4: 语义检索（调用 RAG）
-            rag = None
-            try:
-                from data_modules.rag_adapter import RAGAdapter
-                from data_modules.config import DataModulesConfig
-                config = DataModulesConfig.from_project_root(self.project_root)
-                rag = RAGAdapter(config)
-                if chapter_outline:
-                    results = await rag.hybrid_search(chapter_outline[:200], rerank_top_n=5)
-                    context_pack["rag"]["related_scenes"] = [
-                        {"chapter": r.chapter, "scene": r.scene_index, "content": r.content[:200], "score": r.score}
-                        for r in results[:3]
-                    ]
-            except Exception as e:
-                print(f"[RAG Error] Failed to retrieve context: {e}")
-                import traceback
-                traceback.print_exc()
-                context_pack["rag"]["related_scenes"] = []
-            finally:
-                try:
-                    if rag and getattr(rag, "api_client", None):
-                        close_fn = getattr(rag.api_client, "close", None)
-                        if close_fn:
-                            await close_fn()
-                except Exception as close_err:
-                    print(f"[RAG Error] Failed to close client session: {close_err}")
+            # Step 4: 写作阶段停用 RAG 回灌，避免历史章节措辞污染当前文风。
+            context_pack["rag"]["related_scenes"] = []
 
             # Step 5: 搜索设定集
             worldview = self._read_file(self.project_root / "设定集" / "世界观.md")
@@ -3252,15 +4226,314 @@ class SkillExecutor:
         ref_file = SKILLS_DIR / skill / "references" / ref_path
         return self._read_file(ref_file)
 
+    def _load_project_prompt(self, slot_id: str, genre: str = "", substyle: str = "") -> str:
+        effective_genre = genre or self._get_project_genre()
+        effective_substyle = substyle or self._get_project_substyle()
+        return self._safe_text(
+            get_project_prompt_content(
+                self.project_root,
+                slot_id,
+                effective_genre,
+                effective_substyle,
+            )
+        ).strip()
+
     def _load_template(self, template_name: str) -> str:
         """加载模板文件"""
         template_file = TEMPLATES_DIR / template_name
         return self._read_file(template_file)
 
+    def _resolve_claude_dir(self, start_path: Optional[Path] = None) -> Path:
+        """智能查找 .claude 目录，兼容项目根目录与插件目录。"""
+        curr = start_path or self.project_root
+        for _ in range(5):
+            if (curr / ".claude").exists():
+                return curr / ".claude"
+            if curr.parent == curr:
+                break
+            curr = curr.parent
+        return PROJECT_ROOT / ".claude"
+
+    def _get_writer_prompts_dir(self) -> Path:
+        claude_dir = self._resolve_claude_dir(self.project_root)
+        prompt_dir = claude_dir / "skills" / "webnovel-write" / "prompts"
+        if prompt_dir.exists():
+            return prompt_dir
+        return SKILLS_DIR / "webnovel-write" / "prompts"
+
+    def _format_prompt_text(self, template: str, **kwargs: Any) -> str:
+        if not template:
+            return ""
+        safe_kwargs = {k: self._safe_text(v) for k, v in kwargs.items()}
+        try:
+            return template.format(**safe_kwargs)
+        except (KeyError, ValueError):
+            text = template
+            for k, v in safe_kwargs.items():
+                text = text.replace(f"{{{k}}}", v)
+            return text
+
+    def _adapt_independent_prompt_for_stage(self, prompt: str, stage: str) -> str:
+        text = self._safe_text(prompt).strip()
+        stage_name = self._safe_text(stage).strip() or "当前创作阶段"
+        if not text or any(k in stage_name for k in ["正文", "章节"]):
+            return text
+        text = text.replace("独立写作 prompt", "独立创作 prompt")
+        text = text.replace("正文专属协议", f"当前创作阶段（{stage_name}）专属协议")
+        return text
+
+    def _load_genre_writer_prompt(self, genre: str, stage: str = "章节写作") -> str:
+        template = self._load_project_prompt("genre_writer", genre=genre)
+        if not template:
+            return ""
+        return self._adapt_independent_prompt_for_stage(self._format_prompt_text(
+            template,
+            genre=canonical_genre_id(genre),
+            stage=stage,
+        ), stage)
+
+    def _load_substyle_writer_prompt(self, genre: str, substyle: str = "", stage: str = "章节写作") -> str:
+        effective_substyle = self._get_effective_substyle(genre, substyle)
+        if not effective_substyle:
+            return ""
+        template = self._load_project_prompt(
+            "substyle_writer",
+            genre=genre,
+            substyle=effective_substyle,
+        )
+        if not template:
+            return ""
+        return self._adapt_independent_prompt_for_stage(self._format_prompt_text(
+            template,
+            genre=canonical_genre_id(genre),
+            substyle=effective_substyle,
+            stage=stage,
+        ), stage)
+
+    def _build_independent_stage_prompt_block(self, genre: str, substyle: str = "", stage: str = "章节写作") -> str:
+        stage_name = self._safe_text(stage).strip() or "当前创作阶段"
+        note = (
+            f'以下约束源自题材独立 prompt。若其中出现"正文/章末"等章节级表述，'
+            f"请等价映射为当前阶段（{stage_name}）的风格与结构约束。"
+        )
+        blocks: List[str] = []
+
+        genre_prompt = self._load_genre_writer_prompt(genre, stage=stage_name)
+        if genre_prompt:
+            blocks.append(f"【题材独立创作协议】\n{note}\n{genre_prompt}")
+
+        substyle_prompt = self._load_substyle_writer_prompt(genre, substyle, stage=stage_name)
+        if substyle_prompt:
+            blocks.append(f"【子风格独立创作协议】\n{note}\n{substyle_prompt}")
+
+        return "\n\n".join(blocks)
+
+    def _build_stage_style_bundle(
+        self,
+        genre: str,
+        substyle: str = "",
+        *,
+        stage: str,
+        genre_style_chars: int = 0,
+        genre_examples_chars: int = 0,
+        substyle_examples_chars: int = 0,
+    ) -> tuple[str, str, str]:
+        normalized_genre = canonical_genre_id(genre) or self._safe_text(genre).strip() or "玄幻"
+        normalized_substyle = canonical_substyle_id(normalized_genre, substyle)
+
+        parts: List[str] = []
+        independent_prompt = self._build_independent_stage_prompt_block(
+            normalized_genre,
+            normalized_substyle,
+            stage=stage,
+        )
+        if independent_prompt:
+            parts.append(independent_prompt)
+
+        genre_guard = self._build_genre_guard_instruction(normalized_genre, stage=stage)
+        if genre_guard:
+            parts.append(f"【题材锁定】\n{genre_guard}")
+
+        positive_style = self._build_genre_positive_style_instruction(normalized_genre, stage=stage)
+        if positive_style:
+            parts.append(f"【题材笔调校准】\n{positive_style}")
+
+        substyle_instruction = self._build_substyle_instruction(
+            normalized_genre,
+            normalized_substyle,
+            stage=stage,
+        )
+        if substyle_instruction:
+            parts.append(f"【子风格锁定】\n{substyle_instruction}")
+
+        if genre_style_chars > 0:
+            style_guide = self._load_genre_style_guide(normalized_genre, max_chars=genre_style_chars)
+            if style_guide:
+                parts.append(f"【题材风格参考】\n{style_guide}")
+
+        if substyle_examples_chars > 0:
+            substyle_examples = self._load_substyle_examples(
+                normalized_genre,
+                normalized_substyle,
+                max_chars=substyle_examples_chars,
+            )
+            if substyle_examples:
+                parts.append(
+                    "【子风格示例（只学节奏与侧重点，不照抄）】\n"
+                    f"{substyle_examples}"
+                )
+
+        if genre_examples_chars > 0:
+            genre_examples = self._load_genre_style_examples(
+                normalized_genre,
+                normalized_substyle,
+                max_chars=genre_examples_chars,
+            )
+            if genre_examples:
+                parts.append(
+                    "【题材表达示例（只学语气与句法，不照抄）】\n"
+                    f"{genre_examples}"
+                )
+
+        return "\n\n".join(parts), normalized_genre, normalized_substyle
+
+    def _build_project_stage_style_bundle(
+        self,
+        *,
+        stage: str,
+        genre_style_chars: int = 0,
+        genre_examples_chars: int = 0,
+        substyle_examples_chars: int = 0,
+    ) -> tuple[str, str, str]:
+        return self._build_stage_style_bundle(
+            self._get_project_genre(),
+            self._get_project_substyle(),
+            stage=stage,
+            genre_style_chars=genre_style_chars,
+            genre_examples_chars=genre_examples_chars,
+            substyle_examples_chars=substyle_examples_chars,
+        )
+
+    def _build_chapter_hard_constraints_prompt(
+        self,
+        *,
+        core_constraints: str,
+        worldview: str,
+        protagonist_name: str,
+        protagonist_desc: str,
+        word_count: int,
+    ) -> str:
+        """章节正文的通用硬约束。这里只保留不涉及文风的底线，不参与题材表达。"""
+        safe_constraints = self._safe_text(core_constraints).strip() or "保持剧情清晰、节奏稳定，严格执行大纲。"
+        safe_worldview = self._safe_text(worldview).strip() or "（无）"
+        safe_name = self._safe_text(protagonist_name).strip() or "主角"
+        safe_desc = self._safe_text(protagonist_desc).strip()
+        safe_desc = safe_desc or "（以设定和大纲为准）"
+        return f"""你是一位专业的网文作者。
+
+【章节硬约束（非题材模板）】
+1. 必须严格执行本章大纲中的剧情点、爽点、损耗和收益，禁止脱离大纲自由发挥。
+2. 地名、人名、势力名、物品名、系统词条、境界名必须与大纲和设定严格一致，禁止擅自改名或替换。
+3. 只写本章大纲允许的内容，下一章的核心动作、高潮、结果必须留给下一章。
+4. 章节必须写实时发生的过程，禁止使用"几日后""三天后""半月后"等时间跳跃词直接略过过程。
+5. 输出必须是小说正文，标题使用 `# 第X章 标题` 格式，禁止输出解释、分析、代码块或后台标签。
+6. 正文字数控制在 {word_count}-{word_count + 600} 字，严禁超过 4000 字；剧情点多时优先压缩重复解释，不得注水。
+
+【核心约束】
+{safe_constraints}
+
+【世界观】
+{safe_worldview}
+
+【主角信息】
+{safe_name} - {safe_desc}
+"""
+
+    def _get_project_genre(self) -> str:
+        state = self._load_state() or {}
+        if not isinstance(state, dict):
+            return "玄幻"
+
+        project_info = state.get("project_info", {})
+        genre = ""
+        if isinstance(project_info, dict):
+            genre = self._safe_text(project_info.get("genre", "")).strip()
+        if not genre:
+            genre = self._safe_text(state.get("genre", "")).strip()
+        return canonical_genre_id(genre or "玄幻") or "玄幻"
+
+    def _get_project_substyle(self) -> str:
+        state = self._load_state() or {}
+        if not isinstance(state, dict):
+            return ""
+
+        project_info = state.get("project_info", {})
+        genre = self._get_project_genre()
+        substyle = ""
+        if isinstance(project_info, dict):
+            substyle = self._safe_text(project_info.get("substyle", "")).strip()
+        if not substyle:
+            substyle = self._safe_text(state.get("substyle", "")).strip()
+        return canonical_substyle_id(genre, substyle)
+
+    def _clear_outline_invalidation_state(self) -> None:
+        def clear_flags(state: Dict[str, Any]) -> None:
+            project_info = state.setdefault("project_info", {})
+            project_info["outline_invalidated"] = False
+            project_info["outline_invalidation_reason"] = ""
+            project_info.pop("outline_invalidated_at", None)
+
+        self._update_state(clear_flags)
+
+    def _get_outline_invalidation_reason(self) -> str:
+        state = self._load_state() or {}
+        if not isinstance(state, dict):
+            return ""
+        project_info = state.get("project_info", {})
+        if isinstance(project_info, dict) and project_info.get("outline_invalidated"):
+            return self._safe_text(project_info.get("outline_invalidation_reason", "")).strip()
+        return ""
+
     def _load_genre_template(self, genre: str) -> str:
-        """加载题材模板"""
-        genre_file = TEMPLATES_DIR / "genres" / f"{genre}.md"
-        return self._read_file(genre_file)
+        """加载题材模板。优先模板文件，不存在时回退到 genres 细分知识库。"""
+        raw_genre = self._safe_text(genre).strip()
+
+        template_candidates = [raw_genre] if raw_genre else []
+        all_aliases = get_template_aliases()
+        template_candidates.extend(all_aliases.get(raw_genre, []))
+        for candidate in template_candidates:
+            if not candidate:
+                continue
+            content = self._read_file(TEMPLATES_DIR / "genres" / f"{candidate}.md")
+            if content:
+                return content
+
+        # 回退到 .claude/genres 子目录（多文件知识库）
+        genre_key = self._normalize_genre_key(raw_genre)
+        genre_dir = self._resolve_genre_knowledge_dir(raw_genre)
+        if not genre_dir:
+            return ""
+
+        ordered_files = get_template_preferred_files(genre_key)
+        selected_files: List[Path] = []
+        for name in ordered_files:
+            file = genre_dir / name
+            if file.exists():
+                selected_files.append(file)
+        if not selected_files:
+            selected_files = sorted(genre_dir.glob("*.md"))[:3]
+
+        sections: List[str] = []
+        for f in selected_files[:4]:
+            text = self._read_file(f)
+            if not text:
+                continue
+            sections.append(f"## {f.stem}\n{text}")
+        return "\n\n".join(sections)
+
+    def _load_genre_style_guide(self, genre: str, max_chars: int = 2600) -> str:
+        guide = self._load_genre_template(genre)
+        return self._truncate_text(guide, max_chars, keep_tail=False) if guide else ""
 
     def _load_character_details_for_review(self) -> str:
         """加载角色档案摘要（名字、身份、门派）用于审核时检查角色设定一致性"""
@@ -3590,42 +4863,11 @@ class SkillExecutor:
                 break
         return summaries
 
-    def _load_scene_references(self, outline: str) -> Dict[str, str]:
-        """根据大纲加载场景参考"""
-        refs = {}
-        outline_lower = outline.lower()
-
-        # 战斗戏
-        if any(k in outline_lower for k in ["战斗", "打斗", "对决", "追逐", "厮杀", "出手", "击杀", "斩杀", "交锋", "动手", "冲突", "进攻", "入侵", "敌", "围剿"]):
-            refs["combat"] = self._load_reference("webnovel-write", "writing/combat-scenes.md")
-        
-        # 情感戏
-        if any(k in outline_lower for k in ["告白", "感情", "冲突", "羁绊", "泪", "悲伤", "愤怒", "喜悦", "恐惧", "震惊"]):
-            refs["emotion"] = self._load_reference("webnovel-write", "writing/emotion-psychology.md")
-        
-        # 对话密集
-        if any(k in outline_lower for k in ["对话", "交谈", "争论", "商议", "谈判", "询问", "质问"]):
-            refs["dialogue"] = self._load_reference("webnovel-write", "writing/dialogue-writing.md")
-        
-        # 场景描写（新地点/大场面）
-        if any(k in outline_lower for k in ["抵达", "进入", "来到", "踏入", "宏大", "壮观", "城池", "山门", "宗门"]):
-            refs["scene"] = self._load_reference("webnovel-write", "writing/scene-description.md")
-        
-        # 欲念描写（暧昧/亲密）
-        if any(k in outline_lower for k in ["暧昧", "亲密", "情欲", "诱惑", "美人", "妩媚", "心动"]):
-            refs["desire"] = self._load_reference("webnovel-write", "writing/desire-description.md")
-        
-        # 默认加载排版指南
-        refs["typesetting"] = self._load_reference("webnovel-write", "writing/typesetting.md")
-
-        return refs
-
     async def _generate_chapter_content_stream(
         self,
         chapter: int,
         context_pack: Dict,
         core_constraints: str,
-        scene_refs: Dict[str, str],
         word_count: int
     ):
         """流式生成章节内容"""
@@ -3653,10 +4895,12 @@ class SkillExecutor:
         recent_summaries = context_pack.get("core", {}).get("recent_summaries", [])
         worldview = context_pack.get("global", {}).get("worldview_skeleton", "")
         power_system = context_pack.get("global", {}).get("power_system_skeleton", "")
-        rag_related_scenes = context_pack.get("rag", {}).get("related_scenes", [])
         previous_ending = context_pack.get("core", {}).get("previous_chapter_ending", "")
         character_roster = context_pack.get("core", {}).get("character_roster", "")
         entity_libraries = context_pack.get("global", {}).get("entity_libraries", "")
+        genre = context_pack.get("global", {}).get("genre", "") or self._get_project_genre()
+        substyle = context_pack.get("global", {}).get("substyle", "") or self._get_project_substyle()
+        opening_chapter_instruction = self._build_opening_chapter_instruction(genre, substyle, chapter, chapter_outline)
 
         # 构建前情提要
         recent_context = ""
@@ -3708,94 +4952,47 @@ class SkillExecutor:
             write_budget.get("entity_libraries", 1800),
             keep_tail=False,
         )
-        rag_related_for_prompt = self._format_rag_related_scenes(
-            rag_related_scenes,
-            write_budget.get("rag_scenes", 1400),
+
+        independent_stage_prompt = self._build_independent_stage_prompt_block(
+            genre,
+            substyle,
+            stage="章节写作",
+        )
+        base_writer_template = self._load_project_prompt(
+            "writer_base",
+            genre=genre,
+            substyle=substyle,
+        )
+        base_writer_prompt = self._format_prompt_text(
+            base_writer_template,
+            core_constraints=self._truncate_text(
+                core_constraints,
+                write_budget.get("core_constraints", 2800),
+                keep_tail=True,
+            ) if core_constraints else "保持剧情清晰、节奏稳定，严格执行大纲。",
+            worldview=worldview_for_prompt if worldview_for_prompt else "（无）",
+            protagonist_name=protagonist.get('name', '主角'),
+            protagonist_desc=protagonist.get('personality', '') or "（以设定和大纲为准）",
+        )
+        hard_constraints_prompt = self._build_chapter_hard_constraints_prompt(
+            core_constraints=self._truncate_text(
+                core_constraints,
+                write_budget.get("core_constraints", 2800),
+                keep_tail=True,
+            ) if core_constraints else "保持剧情清晰、节奏稳定，严格执行大纲。",
+            worldview=worldview_for_prompt if worldview_for_prompt else "（无）",
+            protagonist_name=protagonist.get('name', '主角'),
+            protagonist_desc=protagonist.get('personality', ''),
+            word_count=word_count,
         )
 
-        # 智能查找 .claude 目录
-        def find_claude_dir(start_path: Path) -> Path:
-            curr = start_path
-            for _ in range(5):  # 最多向上查找 5 级
-                if (curr / ".claude").exists():
-                    return curr / ".claude"
-                if curr.parent == curr:
-                    break
-                curr = curr.parent
-            # 回退：假设在项目根目录的同级或父级
-            return self.project_root.parent / ".claude"
-
-        claude_dir = find_claude_dir(self.project_root)
-        prompt_path = claude_dir / "skills" / "webnovel-write" / "prompts" / "writer.md"
-
-        # 从文件加载写作 Prompt
-        try:
-            if not prompt_path.exists():
-                 # 兼容性处理：尝试相对于 SKILLS_DIR 的路径
-                 prompt_path = SKILLS_DIR / "webnovel-write" / "prompts" / "writer.md"
-                
-            system_prompt_template = prompt_path.read_text(encoding="utf-8")
-        except Exception as e:
-            print(f"[WARNING] Failed to load writer.md: {e}. Using fallback prompt.")
-            system_prompt_template = """你是一位专业的网文作者。
-**最高指令：必须严格、精准地执行【本章大纲】中的所有剧情点和爽点。**
-大纲是你的创作蓝图，**绝对禁止**脱离大纲自由发挥或随意更改剧情走向。
-
-【核心约束】
-{core_constraints}
-
-【名词与设定严格一致性（最高优先级）】
-1. **地名/人名/势力名**：必须严格照抄大纲。例如大纲写"落云宗"，绝不能写成"流云宗"；大纲写"洗剑峰"，绝不能写成"杂役院"。
-2. **专有名词/金手指术语**：大纲中指定的系统提示、技能名、特殊能力必须原样出现，禁止自行编造或替换为其他名称。
-3. **关键事件**：大纲指定的威胁（如"万剑窟献祭"）必须作为核心冲突，严禁替换为其他套路（如"矿山挖煤"）。
-
-【世界观】
-{worldview}
-
-【主角信息】
-{protagonist_name} - {protagonist_desc}
-
-【创作铁律】
-1. **大纲优先**：若大纲内容与你的构思冲突，以大纲为准。必须写出大纲中提到的所有关键事件、物品和系统提示。
-2. **流畅衔接**：检查[上一章结尾]与[本章大纲]的场景是否连续。如果存在时间跳跃或计划变更（如原本要去A地却留在了B地），必须在开头写一段过渡，解释原因（如"然而，突如其来的变故……"），确保逻辑连贯，再切入大纲剧情。
-3. **爽点还原**：大纲中标记的【爽点】、【系统反馈】、【震惊】等情绪必须在正文中淋漓尽致地展现。
-4. **禁止时间跳跃（极重要）**：
-   - **严禁**使用"几日后"、"三天后"、"一个月后"、"数日之后"等时间跳跃词汇！
-   - 每一章都必须写**实时发生**的剧情，有紧迫感、有节奏！
-   - 如果大纲提到"三天后"，你应该直接写那个时刻正在发生的场景，而不是用旁白交代时间。
-   - ✓ 正确："清晨的阳光洒进房间，今天是约定决斗的日子。"
-   - ✗ 错误："三天后，秦墨来到了演武场。"
-5. **字数控制（最高优先级）**：本章正文必须控制在 **3200-3800 字**，严禁超过 4000 字！
-   - 剧情点多就精炼写，核心事件点到为止
-   - 战斗/对话/心理描写要详略得当，不要注水"""
-
-        # 填充 Prompt 变量
-        format_vars = {
-            "core_constraints": self._truncate_text(core_constraints, write_budget.get("core_constraints", 2800), keep_tail=True) if core_constraints else "保持爽文节奏，每章有爽点",
-            "worldview": worldview_for_prompt if worldview_for_prompt else "（无）",
-            "protagonist_name": protagonist.get('name', '主角'),
-            "protagonist_desc": protagonist.get('personality', ''),
-            "word_count": word_count,
-        }
-        try:
-            system_prompt = system_prompt_template.format(**format_vars)
-        except (KeyError, ValueError) as e:
-            # 模板包含未转义花括号或新增占位符时，回退到可控 replace，避免直接崩溃。
-            self._debug(f"[DEBUG] writer.md format fallback: {e}")
-            system_prompt = system_prompt_template
-            for k, v in format_vars.items():
-                system_prompt = system_prompt.replace(f"{{{k}}}", self._safe_text(v))
-        
-        # 添加场景写作参考（根据大纲自动加载）
-        if scene_refs:
-            scene_ref_text = "\n\n【场景写作参考（请参考以下指南提升写作质量）】\n"
-            scene_ref_limit = write_budget.get("scene_ref_each", 1200)
-            for ref_type, ref_content in scene_refs.items():
-                if ref_content and ref_type != "typesetting":  # 排版指南单独处理
-                    # 只取参考内容的关键部分，避免 token 过多
-                    ref_summary = self._truncate_text(ref_content, scene_ref_limit, keep_tail=False)
-                    scene_ref_text += f"\n--- {ref_type.upper()} 技巧 ---\n{ref_summary}\n"
-            system_prompt += scene_ref_text
+        prompt_layers: List[str] = []
+        if base_writer_prompt:
+            prompt_layers.append(base_writer_prompt)
+        if independent_stage_prompt:
+            prompt_layers.append(independent_stage_prompt)
+        prompt_layers.append(hard_constraints_prompt)
+        system_prompt = "\n\n".join(part for part in prompt_layers if part)
 
         # 添加金手指/系统设计（动态约束，避免设定污染）
         gold_finger = context_pack.get("core", {}).get("gold_finger", "")
@@ -3817,6 +5014,13 @@ class SkillExecutor:
 {power_system_for_prompt}
 
 **重要**：涉及境界、突破条件、战力上限时，必须使用上方体系，不得自创新等级名。"""
+
+        if opening_chapter_instruction:
+            system_prompt += f"""
+
+【开篇章节约束（必须遵守）】
+{opening_chapter_instruction}
+"""
 
         # ========== 最高优先级：死亡角色黑名单（放入 System Prompt 最显眼位置）==========
         dead_warning_system = ""
@@ -3859,7 +5063,6 @@ class SkillExecutor:
         ) or "（无角色档案）"
         chapter_keywords = self._truncate_text(chapter_outline_for_prompt, 120, keep_tail=False)
         next_chapter_keywords = self._truncate_text(next_chapter_outline_for_prompt, 120, keep_tail=False)
-        rag_section = rag_related_for_prompt if rag_related_for_prompt else "（无检索命中）"
 
         context = f"""## 待创作：第 {chapter} 章大纲（必须严格执行！）
 {chapter_outline_for_prompt}
@@ -3888,12 +5091,6 @@ class SkillExecutor:
 以下是已有实体标准名称。正文出现功法/宝物/势力/地点时，优先使用以下名称，不要凭空改名或创造近义别称：
 --------------------------------------------------
 {entity_libraries_for_prompt if entity_libraries_for_prompt else "（设定库为空）"}
---------------------------------------------------
-
-## 🔎 语义检索关联片段（用于保持前后文因果一致）
-仅可借鉴因果与细节，不可照抄原文句子：
---------------------------------------------------
-{rag_section}
 --------------------------------------------------
 
 ## 🚨 剧情边界红线（最高优先级 - 违反即失败！）
@@ -3939,6 +5136,7 @@ class SkillExecutor:
 
 ## 上一章结尾（仅供衔接定位，严禁复述！）
 以下是上一章最后几段原文。你的任务是从**这段文字之后的下一个瞬间**开始写，而不是重新描写这段文字里已经发生的事情。
+它只用于确认事件顺序、角色位置和动作衔接，**不得继承其中的气氛措辞、句法习惯或压抑镜头语言**。
 ⛔ 禁止用不同的措辞重新演绎下面这些内容（换个说法重写也算复述）！
 {previous_ending_for_prompt if previous_ending_for_prompt else "（这是第一章，无需衔接）"}
 
@@ -3973,12 +5171,11 @@ class SkillExecutor:
         chapter: int,
         context_pack: Dict,
         core_constraints: str,
-        scene_refs: Dict[str, str],
         word_count: int
     ) -> str:
         """生成章节内容 (兼容版)"""
         full_content = ""
-        async for chunk in self._generate_chapter_content_stream(chapter, context_pack, core_constraints, scene_refs, word_count):
+        async for chunk in self._generate_chapter_content_stream(chapter, context_pack, core_constraints, word_count):
             if not chunk:
                 continue
             if not chunk.startswith("[ERROR]"):
@@ -4045,9 +5242,20 @@ class SkillExecutor:
             extract_budget.get("techniques", 1400),
             keep_tail=False,
         )
+        style_bundle, normalized_genre, normalized_substyle = self._build_project_stage_style_bundle(
+            stage="章节实体抽取",
+            genre_style_chars=420,
+            genre_examples_chars=0,
+            substyle_examples_chars=0,
+        )
+        substyle_display = normalized_substyle or "默认子风格"
+        style_section = f"【当前阶段题材协议】\n{style_bundle}\n\n" if style_bundle else ""
 
         def build_extract_prompt(chunk_content: str, chunk_index: int, chunk_total: int) -> str:
-            return f"""你是小说世界观分析助手。请分析第{chapter}章的内容，提取新出现的重要元素。
+            return f"""{style_section}你是小说世界观分析助手。请分析第{chapter}章的内容，提取新出现的重要元素。
+
+【题材】
+{normalized_genre} / {substyle_display}
 
 【抽取片段】
 当前处理第 {chunk_index}/{chunk_total} 段（仅输出当前片段中明确出现的事实，禁止臆测）。
@@ -4984,6 +6192,58 @@ class SkillExecutor:
             return
         await self._apply_extraction_results(chapter, content, result["extraction"])
 
+    async def sync_post_save_artifacts(self, chapter: int, content: str) -> Dict[str, Any]:
+        """在用户确认保存后执行持久化副作用（RAG 索引 + 连续性摘要）。"""
+        text = self._safe_text(content)
+        if not text.strip():
+            return {"rag_indexed": False, "continuity_written": False}
+
+        rag_indexed = False
+        continuity_written = False
+
+        rag = None
+        try:
+            from data_modules.rag_adapter import RAGAdapter
+            from data_modules.config import DataModulesConfig
+            rag_config = DataModulesConfig.from_project_root(self.project_root)
+            rag = RAGAdapter(rag_config)
+
+            scene_chunks = self._split_content_for_rag(text, chunk_size=1800, overlap=220)
+            chunks = [
+                {
+                    "chapter": chapter,
+                    "scene_index": item.get("scene_index", idx + 1),
+                    "content": item.get("content", ""),
+                }
+                for idx, item in enumerate(scene_chunks)
+                if self._safe_text(item.get("content", "")).strip()
+            ]
+            await rag.store_chunks(chunks)
+            rag_indexed = True
+        except Exception as e:
+            print(f"[POST-SAVE RAG] Failed: {e}")
+        finally:
+            try:
+                if rag and getattr(rag, "api_client", None):
+                    close_fn = getattr(rag.api_client, "close", None)
+                    if close_fn:
+                        await close_fn()
+            except Exception as close_err:
+                print(f"[POST-SAVE RAG] Failed to close client session: {close_err}")
+
+        try:
+            continuity_summary = await self._generate_continuity_summary(chapter, text)
+            if continuity_summary:
+                continuity_dir = self.project_root / "正文" / ".continuity"
+                continuity_dir.mkdir(parents=True, exist_ok=True)
+                continuity_file = continuity_dir / f"第{chapter}章_状态.md"
+                continuity_file.write_text(continuity_summary, encoding="utf-8")
+                continuity_written = True
+        except Exception as e:
+            print(f"[POST-SAVE CONTINUITY] Failed: {e}")
+
+        return {"rag_indexed": rag_indexed, "continuity_written": continuity_written}
+
     async def _generate_continuity_summary(self, chapter: int, content: str) -> str:
         """生成章节连续性摘要，供下一章参考"""
         if not self.ai_service:
@@ -4994,7 +6254,6 @@ class SkillExecutor:
             continuity_budget.get("content", 9000),
             keep_tail=True,
         )
-        
         prompt = f"""你是一位负责维护小说连续性的编辑。请仔细阅读以下第{chapter}章内容，提取所有【下一章必须遵守】的关键信息。
 
 【第{chapter}章内容】
@@ -5012,6 +6271,12 @@ class SkillExecutor:
 
 【重要】：请特别注意那些容易被忽略但会导致逻辑漏洞的细节！
 比如：有围观群众却假装没人看到、角色明明受伤了却突然生龙活虎、时间地点突然跳跃等。
+
+【写作要求】
+1. 只保留事实、状态、位置、数量、因果、承诺、未完成事项。
+2. 禁止复述原文修辞，禁止保留氛围词、情绪渲染、镜头语言、比喻和文学化表达。
+3. 禁止使用“阴冷”“死寂”“压抑”“诡异”“毛骨悚然”等风格词，除非它本身是剧情规则或角色对白中的必要事实。
+4. 输出要像制作组交接清单，不像小说摘要。
 
 请用简洁清晰的条目列出，不要遗漏任何关键信息。"""
 
@@ -5046,8 +6311,19 @@ class SkillExecutor:
             outline_content,
             budgets.get("outline", 8000),
         ) if outline_content else "（无）"
+        style_bundle, normalized_genre, normalized_substyle = self._build_project_stage_style_bundle(
+            stage="卷纲实体抽取",
+            genre_style_chars=500,
+            genre_examples_chars=0,
+            substyle_examples_chars=0,
+        )
+        substyle_display = normalized_substyle or "默认子风格"
+        style_section = f"【当前阶段题材协议】\n{style_bundle}\n\n" if style_bundle else ""
         
-        prompt = f"""你是小说世界观档案管理助手。请从第{volume}卷大纲中提取**新登场的重要元素**。
+        prompt = f"""{style_section}你是小说世界观档案管理助手。请从第{volume}卷大纲中提取**新登场的重要元素**。
+
+【题材】
+{normalized_genre} / {substyle_display}
 
 【现有角色（不要重复创建）】
 {roster_for_prompt}

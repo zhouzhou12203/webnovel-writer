@@ -16,6 +16,7 @@ const aiTaskStore = useAiTaskStore()
 // State
 const genres = ref([])
 const selectedGenre = ref('')
+const selectedSubstyle = ref('')
 const title = ref('')
 const initTargetWords = ref('')
 const protagonistName = ref('')
@@ -35,7 +36,8 @@ const aiModelsLoading = ref(false)
 const showAiConfig = ref(false) // Default collapsed
 const apiBaseUrls = [
   'http://jiushi.online', 'http://localhost:8000', 'http://127.0.0.1:8317', 'http://localhost:8317', 'https://cifang.xyz',
-  'https://api.openai.com', 'https://api.deepseek.com', 'https://api.moonshot.cn'
+  'https://api.openai.com', 'https://api.deepseek.com', 'https://api.moonshot.cn', 'https://api-inference.modelscope.cn/compatible-mode/v1',
+  'https://api.x.ai/v1', 'https://generativelanguage.googleapis.com/v1beta/openai'
 ]
 
 // Title Editing State
@@ -49,6 +51,9 @@ const generatingTitles = ref(false)
 const showTitlesDialog = ref(false)
 const titleCandidates = ref([])
 const initSteps = ref([])
+const projectGenreDraft = ref('')
+const projectSubstyleDraft = ref('')
+const savingGenreProfile = ref(false)
 
 // Settings Cards State
 const settings = ref({
@@ -66,6 +71,57 @@ const settingsExpanded = ref({
 function showMessage(text, duration = 3000) {
   message.value = text
   setTimeout(() => { if (message.value === text) message.value = '' }, duration)
+}
+
+function normalizeGenres(items = []) {
+  return items.map(item => ({
+    ...item,
+    aliases: item.aliases || [],
+    substyles: item.substyles || []
+  }))
+}
+
+function findGenreOption(value) {
+  if (!value) return null
+  const raw = String(value).trim()
+  return genres.value.find(g =>
+    g.id === raw ||
+    g.name === raw ||
+    (g.aliases || []).includes(raw)
+  ) || null
+}
+
+function pickSubstyleId(genreOption, preferred = '') {
+  const options = genreOption?.substyles || []
+  if (!options.length) return ''
+  const raw = String(preferred || '').trim()
+  const matched = options.find(s => s.id === raw || s.name === raw)
+  return matched?.id || genreOption.default_substyle || options[0].id
+}
+
+function getAvailableSubstyles(genreId) {
+  return findGenreOption(genreId)?.substyles || []
+}
+
+function syncInitGenreSelection(genreValue = '', substyleValue = '') {
+  const matched = findGenreOption(genreValue) || genres.value[0] || null
+  if (!matched) return
+  selectedGenre.value = matched.id
+  selectedSubstyle.value = pickSubstyleId(matched, substyleValue)
+}
+
+function syncProjectGenreDraft(genreValue = '', substyleValue = '') {
+  const matched = findGenreOption(genreValue) || genres.value[0] || null
+  if (!matched) return
+  projectGenreDraft.value = matched.id
+  projectSubstyleDraft.value = pickSubstyleId(matched, substyleValue)
+}
+
+function isGenreProfileDirty() {
+  const matched = findGenreOption(projectStore.genre) || null
+  const currentGenreId = matched?.id || projectStore.genre || ''
+  const currentSubstyleId = pickSubstyleId(matched, projectStore.substyle)
+  return projectGenreDraft.value !== currentGenreId || projectSubstyleDraft.value !== currentSubstyleId
 }
 
 async function loadAiConfig() {
@@ -106,14 +162,34 @@ async function saveAiConfig() {
 onMounted(async () => {
   try {
     const { data } = await aiApi.getGenres()
-    genres.value = data.genres
-    if (genres.value.length > 0) selectedGenre.value = genres.value[0].id
+    genres.value = normalizeGenres(data.genres || [])
+    if (genres.value.length > 0) {
+      selectedGenre.value = genres.value[0].id
+      selectedSubstyle.value = pickSubstyleId(genres.value[0])
+    }
   } catch (e) {
-    genres.value = [
-      { id: '修仙', name: '修仙' }, { id: '系统流', name: '系统流' },
-      { id: '都市异能', name: '都市异能' }, { id: '狗血言情', name: '狗血言情' },
-    ]
+    genres.value = normalizeGenres([
+      {
+        id: '玄幻',
+        name: '玄幻',
+        default_substyle: '热血升级流',
+        substyles: [{ id: '热血升级流', name: '热血升级流' }, { id: '凡人流', name: '凡人流' }]
+      },
+      {
+        id: '规则怪谈',
+        name: '规则怪谈',
+        default_substyle: '规则生存流',
+        substyles: [{ id: '规则生存流', name: '规则生存流' }]
+      },
+      {
+        id: '现代言情',
+        name: '现代言情',
+        default_substyle: '高甜拉扯',
+        substyles: [{ id: '高甜拉扯', name: '高甜拉扯' }]
+      }
+    ])
     selectedGenre.value = genres.value[0].id
+    selectedSubstyle.value = pickSubstyleId(genres.value[0])
   }
   await loadAiConfig()
   await projectStore.fetchStatus()
@@ -125,10 +201,8 @@ onMounted(async () => {
   
   // Sync inputs with stored data
   if (projectStore.title && !title.value) title.value = projectStore.title
-  if (projectStore.genre) {
-     const matched = genres.value.find(g => g.name === projectStore.genre || g.id === projectStore.genre)
-     if (matched) selectedGenre.value = matched.id
-  }
+  syncInitGenreSelection(projectStore.genre, projectStore.substyle)
+  syncProjectGenreDraft(projectStore.genre, projectStore.substyle)
   if (projectStore.targetWords && !projectStore.initialized && !initTargetWords.value) {
     initTargetWords.value = String(projectStore.targetWords)
   }
@@ -152,15 +226,29 @@ watch(() => projectStore.title, (newVal) => {
   if (newVal && !title.value && !projectStore.initialized) title.value = newVal
 })
 watch(() => projectStore.genre, (newVal) => {
-  if (newVal && !selectedGenre.value && !projectStore.initialized) {
-     const matched = genres.value.find(g => g.name === newVal || g.id === newVal)
-     if (matched) selectedGenre.value = matched.id
+  if (!newVal) return
+  if (!projectStore.initialized) syncInitGenreSelection(newVal, projectStore.substyle)
+  syncProjectGenreDraft(newVal, projectStore.substyle)
+})
+watch(() => projectStore.substyle, (newVal) => {
+  if (!projectStore.initialized) {
+    syncInitGenreSelection(projectStore.genre, newVal)
+    return
   }
+  syncProjectGenreDraft(projectStore.genre, newVal)
 })
 watch(() => projectStore.targetWords, (newVal) => {
   if (newVal && !projectStore.initialized && !initTargetWords.value) {
     initTargetWords.value = String(newVal)
   }
+})
+watch(selectedGenre, (newVal) => {
+  const matched = findGenreOption(newVal)
+  if (matched) selectedSubstyle.value = pickSubstyleId(matched, selectedSubstyle.value)
+})
+watch(projectGenreDraft, (newVal) => {
+  const matched = findGenreOption(newVal)
+  if (matched) projectSubstyleDraft.value = pickSubstyleId(matched, projectSubstyleDraft.value)
 })
 
 // Actions
@@ -195,6 +283,7 @@ async function initProject() {
     const payload = {
       title: title.value,
       genre: selectedGenre.value,
+      substyle: selectedSubstyle.value,
       protagonist_name: protagonistName.value,
       golden_finger_name: goldenFingerName.value,
       golden_finger_type: goldenFingerType.value,
@@ -202,6 +291,14 @@ async function initProject() {
       mode: 'standard'
     }
     if (parsedTargetWords) payload.target_words = parsedTargetWords
+
+    await aiApi.updateProjectInfo({
+      title: title.value,
+      genre: selectedGenre.value,
+      substyle: selectedSubstyle.value,
+      ...(parsedTargetWords ? { target_words: parsedTargetWords } : {})
+    })
+    await projectStore.fetchStatus()
 
     await aiTaskStore.initProjectAction({
       ...payload
@@ -213,6 +310,33 @@ async function initProject() {
     showMessage('初始化失败：' + e.message)
   } finally {
     loading.value = false
+  }
+}
+
+async function saveGenreProfile() {
+  if (!projectStore.initialized || !isGenreProfileDirty()) return
+  savingGenreProfile.value = true
+  try {
+    const { data } = await aiApi.updateProjectInfo({
+      genre: projectGenreDraft.value,
+      substyle: projectSubstyleDraft.value
+    })
+    await projectStore.fetchStatus()
+    syncProjectGenreDraft(projectStore.genre, projectStore.substyle)
+    const preservedSlots = data?.preserved_custom_prompt_slots || []
+    if (projectStore.outlineInvalidated && preservedSlots.length) {
+      showMessage('✓ 题材方向已更新；已保留你的自定义题材提示词，请同步检查总纲与提示词配置')
+    } else if (projectStore.outlineInvalidated) {
+      showMessage('✓ 题材方向已更新，请先重生成总纲/卷纲')
+    } else if (preservedSlots.length) {
+      showMessage('✓ 题材方向已更新；已保留你的自定义题材提示词')
+    } else {
+      showMessage('✓ 题材方向已更新')
+    }
+  } catch (e) {
+    showMessage('✗ 题材方向更新失败')
+  } finally {
+    savingGenreProfile.value = false
   }
 }
 
@@ -436,7 +560,7 @@ async function rebuildIndex() {
                   <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="size-6"><path stroke-linecap="round" stroke-linejoin="round" d="M9.568 3H5.25A2.25 2.25 0 0 0 3 5.25v4.318c0 .597.237 1.17.659 1.591l9.581 9.581c.699.699 1.78.872 2.607.33a18.095 18.095 0 0 0 5.223-5.223c.542-.827.369-1.908-.33-2.607L11.16 3.66A2.25 2.25 0 0 0 9.568 3Z" /></svg>
                 </div>
                 <div class="stat-info">
-                  <div class="stat-val text-sm">{{ projectStore.genre || '未设定' }}</div>
+                  <div class="stat-val text-sm">{{ projectStore.substyle ? `${projectStore.genre} · ${projectStore.substyle}` : (projectStore.genre || '未设定') }}</div>
                   <div class="stat-lab">题材</div>
                 </div>
              </div>
@@ -450,6 +574,43 @@ async function rebuildIndex() {
                   <div class="stat-lab">状态</div>
                 </div>
              </div>
+          </div>
+
+          <div v-if="projectStore.outlineInvalidated" class="outline-warning-banner">
+            <div class="warning-title">题材方向已变更</div>
+            <div class="warning-body">{{ projectStore.outlineInvalidationReason || '现有总纲与卷纲仍基于旧方向，请先重新生成总纲/卷纲。' }}</div>
+          </div>
+
+          <div class="genre-profile-card">
+            <div class="genre-profile-head">
+              <div>
+                <h3>题材方向</h3>
+                <p>题材与子风格会同时约束总纲、分卷和正文。</p>
+              </div>
+              <button
+                class="btn btn-sm btn-primary-gradient"
+                @click="saveGenreProfile"
+                :disabled="savingGenreProfile || !isGenreProfileDirty()"
+              >
+                {{ savingGenreProfile ? '保存中...' : '保存题材方向' }}
+              </button>
+            </div>
+            <div class="form-grid genre-profile-grid">
+              <div class="form-group">
+                <label>主题材</label>
+                <select v-model="projectGenreDraft" class="input-modern">
+                  <option v-for="g in genres" :key="g.id" :value="g.id">{{ g.name }}</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>子风格</label>
+                <select v-model="projectSubstyleDraft" class="input-modern">
+                  <option v-for="s in getAvailableSubstyles(projectGenreDraft)" :key="s.id" :value="s.id">
+                    {{ s.name }}
+                  </option>
+                </select>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -595,6 +756,15 @@ async function rebuildIndex() {
               <label>题材分类</label>
               <select v-model="selectedGenre" class="input-modern">
                  <option v-for="g in genres" :key="g.id" :value="g.id">{{ g.name }}</option>
+              </select>
+           </div>
+
+           <div class="form-group">
+              <label>子风格</label>
+              <select v-model="selectedSubstyle" class="input-modern">
+                 <option v-for="s in getAvailableSubstyles(selectedGenre)" :key="s.id" :value="s.id">
+                   {{ s.name }}
+                 </option>
               </select>
            </div>
 
@@ -792,6 +962,52 @@ async function rebuildIndex() {
 }
 .stat-val { font-weight: 700; color: #111827; font-size: 1.1rem; line-height: 1.2; }
 .stat-lab { font-size: 0.75rem; color: #9ca3af; }
+.outline-warning-banner {
+  margin-top: 1rem;
+  padding: 1rem 1.1rem;
+  border-radius: 14px;
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
+}
+.warning-title {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: #9a3412;
+  margin-bottom: 0.25rem;
+}
+.warning-body {
+  font-size: 0.9rem;
+  line-height: 1.6;
+  color: #7c2d12;
+}
+.genre-profile-card {
+  margin-top: 1rem;
+  padding: 1.1rem;
+  border-radius: 14px;
+  background: #f8fafc;
+  border: 1px solid #e5e7eb;
+}
+.genre-profile-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+.genre-profile-head h3 {
+  margin: 0 0 0.25rem;
+  font-size: 1rem;
+  font-weight: 700;
+  color: #111827;
+}
+.genre-profile-head p {
+  margin: 0;
+  font-size: 0.85rem;
+  color: #6b7280;
+}
+.genre-profile-grid {
+  margin-bottom: 0;
+}
 
 /* Guide Section */
 .guide-section { margin: 2.5rem 0; }
@@ -975,6 +1191,10 @@ async function rebuildIndex() {
     width: 130px;
   }
   .settings-grid { grid-template-columns: 1fr; }
+  .genre-profile-head {
+    flex-direction: column;
+    align-items: stretch;
+  }
 }
 .setting-card {
   cursor: pointer;

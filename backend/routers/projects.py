@@ -10,6 +10,14 @@ from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel
 from services import projects_manager
 from services.activity_logger import get_logger
+from services.genre_catalog import canonical_genre_id, canonical_substyle_id, list_supported_genres
+from services.project_prompt_store import (
+    get_project_prompt_config,
+    update_project_prompt_contents,
+    reset_project_prompts,
+    ensure_project_prompts,
+    sync_project_prompts_for_profile_change,
+)
 from dependencies import get_project_root
 
 router = APIRouter()
@@ -25,9 +33,12 @@ class ProjectStatus(BaseModel):
     target_words: Optional[int] = None  # 目标字数
     protagonist: Optional[dict] = None
     genre: Optional[str] = None
+    substyle: Optional[str] = None
     title: Optional[str] = None
     description: Optional[str] = None  # 小说简介
     status: str = "连载中"  # 项目状态：连载中/已完结
+    outline_invalidated: bool = False
+    outline_invalidation_reason: Optional[str] = None
 
 
 class ProjectConfig(BaseModel):
@@ -42,7 +53,21 @@ class ProjectConfig(BaseModel):
 class InitRequest(BaseModel):
     """项目初始化请求"""
     genre: str = "修仙"
+    substyle: str = ""
     mode: str = "standard"
+
+
+class PromptSlotUpdate(BaseModel):
+    id: str
+    content: str
+
+
+class ProjectPromptConfigUpdate(BaseModel):
+    prompts: List[PromptSlotUpdate]
+
+
+class ProjectPromptResetRequest(BaseModel):
+    slot_ids: Optional[List[str]] = None
 
 
 # ======= 工具函数 =======
@@ -103,12 +128,16 @@ async def get_status(root: Path = Depends(get_project_root)):
         info = state.get("project_info", {})
         if info:
             status.genre = info.get("genre")
+            status.substyle = info.get("substyle")
             status.title = info.get("title")
             status.target_words = info.get("target_words")
             status.description = info.get("description") or info.get("synopsis")
             status.status = info.get("status", "连载中")
+            status.outline_invalidated = bool(info.get("outline_invalidated", False))
+            status.outline_invalidation_reason = info.get("outline_invalidation_reason")
         else:
             status.genre = state.get("genre")
+            status.substyle = state.get("substyle")
             status.title = state.get("title")
             status.target_words = state.get("target_words")
             status.description = state.get("description") or state.get("synopsis")
@@ -230,9 +259,75 @@ async def update_config(config: ProjectConfig, root: Path = Depends(get_project_
     return {"success": True}
 
 
+@router.get("/prompt-config")
+async def get_prompt_config(root: Path = Depends(get_project_root)):
+    """获取项目级 Prompt 配置"""
+    state_file = root / ".webnovel" / "state.json"
+    genre = "玄幻"
+    substyle = ""
+
+    if state_file.exists():
+        try:
+            with open(state_file, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            info = state.get("project_info", {})
+            if info:
+                genre = info.get("genre") or state.get("genre") or genre
+                substyle = info.get("substyle") or state.get("substyle") or ""
+            else:
+                genre = state.get("genre") or genre
+                substyle = state.get("substyle") or ""
+        except Exception:
+            pass
+
+    return get_project_prompt_config(root, genre, substyle)
+
+
+@router.put("/prompt-config")
+async def update_prompt_config(
+    payload: ProjectPromptConfigUpdate,
+    root: Path = Depends(get_project_root),
+):
+    """更新项目级 Prompt 配置"""
+    update_project_prompt_contents(
+        root,
+        [{"id": item.id, "content": item.content} for item in payload.prompts],
+    )
+    return {"success": True}
+
+
+@router.post("/prompt-config/reset")
+async def reset_prompt_config(
+    payload: ProjectPromptResetRequest,
+    root: Path = Depends(get_project_root),
+):
+    """重置项目级 Prompt 配置为当前题材默认模板"""
+    state_file = root / ".webnovel" / "state.json"
+    genre = "玄幻"
+    substyle = ""
+
+    if state_file.exists():
+        try:
+            with open(state_file, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            info = state.get("project_info", {})
+            if info:
+                genre = info.get("genre") or state.get("genre") or genre
+                substyle = info.get("substyle") or state.get("substyle") or ""
+            else:
+                genre = state.get("genre") or genre
+                substyle = state.get("substyle") or ""
+        except Exception:
+            pass
+
+    reset_project_prompts(root, genre, substyle, slot_ids=payload.slot_ids)
+    return get_project_prompt_config(root, genre, substyle)
+
+
 class ProjectInfoUpdate(BaseModel):
     title: Optional[str] = None
     genre: Optional[str] = None
+    substyle: Optional[str] = None
     description: Optional[str] = None
     target_words: Optional[int] = None
 
@@ -255,13 +350,38 @@ async def update_info(info: ProjectInfoUpdate, root: Path = Depends(get_project_
             state["project_info"] = {
                 "title": state.pop("title", ""),
                 "genre": state.pop("genre", ""),
+                "substyle": state.pop("substyle", ""),
                 "description": state.pop("description", "")
             }
-            
+
+        previous_genre = canonical_genre_id(state["project_info"].get("genre") or state.get("genre") or "修仙")
+        previous_substyle = canonical_substyle_id(
+            previous_genre,
+            state["project_info"].get("substyle") or state.get("substyle") or "",
+        )
+
         if info.title is not None:
             state["project_info"]["title"] = info.title
         if info.genre is not None:
-            state["project_info"]["genre"] = info.genre
+            normalized_genre = canonical_genre_id(info.genre)
+            state["project_info"]["genre"] = normalized_genre
+            state["genre"] = normalized_genre
+        else:
+            normalized_genre = canonical_genre_id(state["project_info"].get("genre") or state.get("genre") or "修仙")
+            state["project_info"]["genre"] = normalized_genre
+
+        if info.substyle is not None:
+            normalized_substyle = canonical_substyle_id(normalized_genre, info.substyle)
+            state["project_info"]["substyle"] = normalized_substyle
+            state["substyle"] = normalized_substyle
+        else:
+            normalized_substyle = canonical_substyle_id(
+                normalized_genre,
+                state["project_info"].get("substyle") or state.get("substyle") or "",
+            )
+            state["project_info"]["substyle"] = normalized_substyle
+            state["substyle"] = normalized_substyle
+
         if info.description is not None:
             state["project_info"]["description"] = info.description
         if info.target_words is not None:
@@ -270,11 +390,42 @@ async def update_info(info: ProjectInfoUpdate, root: Path = Depends(get_project_
             state["project_info"]["target_words"] = info.target_words
             # 兼容旧版读取逻辑
             state["target_words"] = info.target_words
+
+        changed_fields = []
+        if normalized_genre != previous_genre:
+            changed_fields.append("题材")
+        if normalized_substyle != previous_substyle:
+            changed_fields.append("子风格")
+
+        should_invalidate_outline = bool(state.get("initialized"))
+
+        preserved_custom_prompt_slots: List[str] = []
+        if changed_fields:
+            sync_result = sync_project_prompts_for_profile_change(
+                root,
+                normalized_genre,
+                normalized_substyle,
+                slot_ids=["genre_writer", "substyle_writer"],
+            )
+            preserved_custom_prompt_slots = sync_result.get("preserved_customized_slots", [])
+            if should_invalidate_outline:
+                state["project_info"]["outline_invalidated"] = True
+                state["project_info"]["outline_invalidation_reason"] = (
+                    f"{'、'.join(changed_fields)}已变更，现有总纲与分卷大纲仍基于旧方向，请先重新生成总纲/卷纲。"
+                )
+                state["project_info"]["outline_invalidated_at"] = datetime.now().isoformat()
+        else:
+            ensure_project_prompts(root, normalized_genre, normalized_substyle)
             
         with open(state_file, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
             
-        return {"success": True}
+        return {
+            "success": True,
+            "preserved_custom_prompt_slots": preserved_custom_prompt_slots,
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -282,6 +433,8 @@ async def update_info(info: ProjectInfoUpdate, root: Path = Depends(get_project_
 @router.post("/init")
 async def init_project(request: InitRequest, root: Path = Depends(get_project_root)):
     """初始化项目"""
+    genre = canonical_genre_id(request.genre)
+    substyle = canonical_substyle_id(genre, request.substyle)
     
     # 计算项目内路径
     webnovel_dir = root / ".webnovel"
@@ -311,7 +464,8 @@ async def init_project(request: InitRequest, root: Path = Depends(get_project_ro
 
     state = {
         "title": current_state.get("title", current_state.get("project_info", {}).get("title", root.name)),
-        "genre": request.genre,
+        "genre": genre,
+        "substyle": substyle,
         "mode": request.mode,
         "current_chapter": 0,
         "protagonist": None,
@@ -321,6 +475,7 @@ async def init_project(request: InitRequest, root: Path = Depends(get_project_ro
     
     with open(state_file, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+    ensure_project_prompts(root, genre, substyle)
     
     # 创建总纲模板
     outline_file = root / "大纲" / "总纲.md"
@@ -328,7 +483,8 @@ async def init_project(request: InitRequest, root: Path = Depends(get_project_ro
         outline_file.write_text(f"""# 小说总纲
 
 ## 基本信息
-- **题材**: {request.genre}
+- **题材**: {genre}
+- **子风格**: {substyle}
 - **预计字数**: 待定
 - **核心卖点**: 待定
 
@@ -342,32 +498,13 @@ async def init_project(request: InitRequest, root: Path = Depends(get_project_ro
 - 第一卷：待定
 """, encoding="utf-8")
     
-    return {"success": True, "message": f"项目已初始化，题材：{request.genre}"}
+    return {"success": True, "message": f"项目已初始化，题材：{genre} / {substyle}"}
 
 
 @router.get("/genres")
 async def get_genres():
     """获取可用题材列表"""
-    genres_dir = Path(__file__).parent.parent.parent / ".claude" / "genres"
-    genres = []
-    
-    if genres_dir.exists():
-        for f in genres_dir.glob("*.md"):
-            genres.append({"id": f.stem, "name": f.stem})
-    
-    # 默认题材列表
-    if not genres:
-        genres = [
-            {"id": "修仙", "name": "修仙"},
-            {"id": "系统流", "name": "系统流"},
-            {"id": "都市异能", "name": "都市异能"},
-            {"id": "规则怪谈", "name": "规则怪谈"},
-            {"id": "替身文", "name": "替身文"},
-            {"id": "多子多福", "name": "多子多福"},
-            {"id": "黑暗题材", "name": "黑暗题材"},
-        ]
-    
-    return {"genres": genres}
+    return {"genres": list_supported_genres()}
 
 
 @router.delete("/reset")
@@ -458,12 +595,13 @@ class ProjectCreateRequest(BaseModel):
     name: str
     path: str
     genre: str = "修仙"
+    substyle: str = ""
 
 
 @router.post("/create")
 async def create_project_api(request: ProjectCreateRequest):
     """创建新项目"""
-    result = projects_manager.create_project(request.name, request.path, request.genre)
+    result = projects_manager.create_project(request.name, request.path, request.genre, request.substyle)
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
     return result

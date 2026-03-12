@@ -207,6 +207,7 @@ def init_project(
     title: str,
     genre: str,
     *,
+    substyle: str = "",
     protagonist_name: str = "",
     target_words: int = 2_000_000,
     target_chapters: int = 600,
@@ -261,6 +262,7 @@ def init_project(
         {
             "title": title,
             "genre": genre,
+            "substyle": substyle,
             "created_at": created_at,
             "target_words": int(target_words),
             "target_chapters": int(target_chapters),
@@ -309,7 +311,7 @@ def init_project(
             [
                 "# 世界观",
                 "",
-                f"> 项目：{title}｜题材：{genre}｜创建：{now}",
+                f"> 项目：{title}｜题材：{genre}｜子风格：{substyle or '（待定）'}｜创建：{now}",
                 "",
                 "## 一句话世界观",
                 "- （用一句话说明世界的核心规则与卖点）",
@@ -336,7 +338,7 @@ def init_project(
             [
                 "# 力量体系",
                 "",
-                f"> 项目：{title}｜题材：{genre}｜创建：{now}",
+                f"> 项目：{title}｜题材：{genre}｜子风格：{substyle or '（待定）'}｜创建：{now}",
                 "",
                 "## 等级/境界划分",
                 "- （列出从弱到强的等级，含突破条件与代价）",
@@ -401,7 +403,7 @@ def init_project(
             [
                 "# 金手指设计",
                 "",
-                f"> 项目：{title}｜题材：{genre}｜创建：{now}",
+                f"> 项目：{title}｜题材：{genre}｜子风格：{substyle or '（待定）'}｜创建：{now}",
                 "",
                 "## 选型",
                 f"- 称呼：{golden_finger_name or '（待填写）'}",
