@@ -29,23 +29,24 @@
 
 ### 防幻觉三定律
 
-| 定律 | 说明 | 执行方式 |
-|------|------|---------|
+| 定律           | 说明                 | 执行方式                       |
+| -------------- | -------------------- | ------------------------------ |
 | **大纲即法律** | 遵循大纲，不擅自发挥 | Context Agent 强制加载章节大纲 |
-| **设定即物理** | 遵守设定，不自相矛盾 | Consistency Checker 实时校验 |
-| **发明需识别** | 新实体必须入库管理 | Data Agent 自动提取并消歧 |
+| **设定即物理** | 遵守设定，不自相矛盾 | Consistency Checker 实时校验   |
+| **发明需识别** | 新实体必须入库管理   | Data Agent 自动提取并消歧      |
 
 ### Strand Weave 节奏系统
 
 三线交织的叙事节奏控制：
 
-| Strand | 含义 | 理想占比 | 说明 |
-|--------|------|---------|------|
-| **Quest** | 主线剧情 | 60% | 推动核心冲突 |
-| **Fire** | 感情线 | 20% | 人物关系发展 |
-| **Constellation** | 世界观扩展 | 20% | 背景/势力/设定 |
+| Strand            | 含义       | 理想占比 | 说明           |
+| ----------------- | ---------- | -------- | -------------- |
+| **Quest**         | 主线剧情   | 60%      | 推动核心冲突   |
+| **Fire**          | 感情线     | 20%      | 人物关系发展   |
+| **Constellation** | 世界观扩展 | 20%      | 背景/势力/设定 |
 
 **节奏红线**：
+
 - Quest 连续不超过 5 章
 - Fire 断档不超过 10 章
 - 每章至少包含 2 种 Strand
@@ -89,11 +90,11 @@
 
 ### 前置要求
 
-| 依赖 | 版本要求 | 说明 |
-|------|---------|------|
-| Python | >= 3.8 | 数据处理脚本运行环境 |
-| Claude Code | 最新版 | Anthropic 官方 CLI 工具 |
-| Git | 任意版本 | 版本控制和章节备份 |
+| 依赖        | 版本要求 | 说明                    |
+| ----------- | -------- | ----------------------- |
+| Python      | >= 3.8   | 数据处理脚本运行环境    |
+| Claude Code | 最新版   | Anthropic 官方 CLI 工具 |
+| Git         | 任意版本 | 版本控制和章节备份      |
 
 ### 1. 安装
 
@@ -102,7 +103,7 @@
 cd your-novel-project
 
 # 克隆插件到 .claude 目录
-git clone https://github.com/lingfengQAQ/webnovel-writer.git .claude
+git clone https://github.com/981029l/webnovel-writer.git .claude
 
 # 安装 Python 依赖
 pip install -r .claude/scripts/requirements.txt
@@ -110,10 +111,10 @@ pip install -r .claude/scripts/requirements.txt
 
 **Python 依赖说明**：
 
-| 包名 | 用途 |
-|------|------|
-| aiohttp | 异步 HTTP 客户端，用于 Embedding/Reranker API 调用 |
-| filelock | 文件锁，防止 state.json 并发写入冲突 |
+| 包名     | 用途                                               |
+| -------- | -------------------------------------------------- |
+| aiohttp  | 异步 HTTP 客户端，用于 Embedding/Reranker API 调用 |
+| filelock | 文件锁，防止 state.json 并发写入冲突               |
 
 ### 2. 初始化项目
 
@@ -165,6 +166,7 @@ npm run dev
 **职责**：为写作准备精准的上下文
 
 **工作流程**：
+
 1. 读取本章大纲，分析需要什么信息
 2. 从 `state.json` 获取主角状态快照
 3. 调用 `index.db` (v5.1 schema) 查询相关实体和别名
@@ -174,6 +176,7 @@ npm run dev
 7. 组装上下文包 JSON
 
 **输出结构**：
+
 ```json
 {
   "core": {
@@ -206,6 +209,7 @@ npm run dev
 **职责**：从正文中语义化提取实体并同步状态
 
 **工作流程**：
+
 1. **实体提取**：识别角色/地点/物品/招式/势力
 2. **实体消歧**：
    - 高置信度 (>0.8)：自动采用
@@ -216,6 +220,7 @@ npm run dev
 5. **向量嵌入**：调用 RAG 存入向量库
 
 **输出格式**：
+
 ```json
 {
   "entities_extracted": [...],
@@ -234,30 +239,30 @@ npm run dev
 
 ## 五维并行审查
 
-| Checker | 检查内容 | 关键指标 |
-|---------|---------|---------|
-| **High-point Checker** | 爽点密度与质量 | 6种执行模式、30/40/30结构 |
-| **Consistency Checker** | 战力/地点/时间线 | 设定即物理定律 |
-| **Pacing Checker** | Strand 比例分布 | Quest/Fire/Constellation |
-| **OOC Checker** | 人物言行是否符合人设 | 角色卡片对照 |
-| **Continuity Checker** | 场景转换流畅度 | 伏笔回收情况 |
+| Checker                 | 检查内容             | 关键指标                    |
+| ----------------------- | -------------------- | --------------------------- |
+| **High-point Checker**  | 爽点密度与质量       | 6 种执行模式、30/40/30 结构 |
+| **Consistency Checker** | 战力/地点/时间线     | 设定即物理定律              |
+| **Pacing Checker**      | Strand 比例分布      | Quest/Fire/Constellation    |
+| **OOC Checker**         | 人物言行是否符合人设 | 角色卡片对照                |
+| **Continuity Checker**  | 场景转换流畅度       | 伏笔回收情况                |
 
 ### 爽点六大执行模式
 
-| 模式 | 模式标识 | 典型触发 |
-|------|---------|---------|
-| 装逼打脸 | Flex & Counter | 嘲讽 → 反转 → 震惊 |
-| 扮猪吃虎 | Underdog Reveal | 示弱 → 暴露 → 碾压 |
-| 越级反杀 | Underdog Victory | 差距 → 策略 → 逆转 |
-| 打脸权威 | Authority Challenge | 权威 → 挑战 → 成功 |
-| 反派翻车 | Villain Downfall | 得意 → 反杀 → 落幕 |
-| 甜蜜超预期 | Sweet Surprise | 期待 → 超预期 → 升华 |
+| 模式       | 模式标识            | 典型触发             |
+| ---------- | ------------------- | -------------------- |
+| 装逼打脸   | Flex & Counter      | 嘲讽 → 反转 → 震惊   |
+| 扮猪吃虎   | Underdog Reveal     | 示弱 → 暴露 → 碾压   |
+| 越级反杀   | Underdog Victory    | 差距 → 策略 → 逆转   |
+| 打脸权威   | Authority Challenge | 权威 → 挑战 → 成功   |
+| 反派翻车   | Villain Downfall    | 得意 → 反杀 → 落幕   |
+| 甜蜜超预期 | Sweet Surprise      | 期待 → 超预期 → 升华 |
 
 ### 爽点密度基准
 
 - **每章**：≥ 1 cool-point (任何单一模式)
-- **每5章**：≥ 1 combo cool-point (2种以上模式叠加)
-- **每10章**：≥ 1 milestone victory (改变主角地位的阶段性胜利)
+- **每 5 章**：≥ 1 combo cool-point (2 种以上模式叠加)
+- **每 10 章**：≥ 1 milestone victory (改变主角地位的阶段性胜利)
 
 ---
 
@@ -273,10 +278,10 @@ npm run dev
 
 ### 配置
 
-| 组件 | 默认提供商 | 默认模型 |
-|-----|----------|---------|
+| 组件      | 默认提供商        | 默认模型                |
+| --------- | ----------------- | ----------------------- |
 | Embedding | ModelScope (魔搭) | Qwen/Qwen3-Embedding-8B |
-| Reranker | Jina AI | jina-reranker-v3 |
+| Reranker  | Jina AI           | jina-reranker-v3        |
 
 ### 环境变量
 
@@ -300,7 +305,7 @@ RERANK_API_KEY=jina_xxx
 
 - **Context Agent** 自动调用 RAG 检索相关历史场景
 - **Data Agent** 自动将章节场景向量化存入数据库
-- 支持失败重试（指数退避，最多3次）
+- 支持失败重试（指数退避，最多 3 次）
 
 ---
 
@@ -308,16 +313,16 @@ RERANK_API_KEY=jina_xxx
 
 系统内置 10+ 种热门网文题材模板：
 
-| 题材 | 说明 |
-|------|------|
-| 修仙 | 境界体系、宗门体系、秘境夺宝 |
-| 系统流 | 面板设计、任务系统、奖励机制 |
-| 都市异能 | 隐藏实力、家族势力、权贵互动 |
-| 规则怪谈 | 规则推理、恐怖氛围、反杀怪谈 |
-| 替身文 | 五阶段心理线、追妻火葬场、身份反转 |
-| 多子多福 | 后宫系统、子嗣养成、系统奖励 |
-| 黑暗题材 | 吞噬进化、势力建立、压扬比例 |
-| ... | 更多模板持续更新 |
+| 题材     | 说明                               |
+| -------- | ---------------------------------- |
+| 修仙     | 境界体系、宗门体系、秘境夺宝       |
+| 系统流   | 面板设计、任务系统、奖励机制       |
+| 都市异能 | 隐藏实力、家族势力、权贵互动       |
+| 规则怪谈 | 规则推理、恐怖氛围、反杀怪谈       |
+| 替身文   | 五阶段心理线、追妻火葬场、身份反转 |
+| 多子多福 | 后宫系统、子嗣养成、系统奖励       |
+| 黑暗题材 | 吞噬进化、势力建立、压扬比例       |
+| ...      | 更多模板持续更新                   |
 
 ---
 
@@ -460,12 +465,14 @@ git checkout ch0045
 ## 版本历史
 
 ### v5.1 (当前)
+
 - SQLite 存储：entities/aliases/state_changes 迁移到 index.db
 - state.json 精简至 < 5KB
 - API 重试机制（指数退避）
 - 6 种爽点执行模式
 
 ### v5.0
+
 - 双 Agent 架构 (Context + Data)
 - 纯正文写作，无需 XML 标签
 - 5 维并行审查
