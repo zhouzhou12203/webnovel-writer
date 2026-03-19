@@ -1,4 +1,4 @@
-# Copyright (c) 2026 左岚. All rights reserved.
+ 
 """FastAPI 入口文件 - Webnovel Writer 后端服务 (v1.0.1)"""
 
 import sys

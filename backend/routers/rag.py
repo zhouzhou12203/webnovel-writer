@@ -1,4 +1,4 @@
-# Copyright (c) 2026 左岚. All rights reserved.
+ 
 """RAG 检索 API"""
 
 import asyncio

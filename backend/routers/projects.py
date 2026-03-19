@@ -1,4 +1,4 @@
-# Copyright (c) 2026 左岚. All rights reserved.
+ 
 """项目管理 API"""
 
 import json

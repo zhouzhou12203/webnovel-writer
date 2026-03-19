@@ -1,4 +1,4 @@
-# Copyright (c) 2026 左岚. All rights reserved.
+ 
 """大纲管理 API"""
 
 import re

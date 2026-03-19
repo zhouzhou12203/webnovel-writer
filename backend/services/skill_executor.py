@@ -1,4 +1,4 @@
-# Copyright (c) 2026 左岚. All rights reserved.
+ 
 """Skills 执行器 - 完整复用 .claude 目录中的 Skills 工作流"""
 
 import sys

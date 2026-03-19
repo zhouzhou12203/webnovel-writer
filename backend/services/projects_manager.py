@@ -1,4 +1,4 @@
-# Copyright (c) 2026 左岚. All rights reserved.
+ 
 # projects_manager.py - 多项目管理服务
 import json
 import uuid

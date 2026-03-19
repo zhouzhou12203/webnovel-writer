@@ -1,4 +1,4 @@
-# Copyright (c) 2026 左岚. All rights reserved.
+ 
 """角色管理 API - 查看和编辑角色库中的角色文件"""
 
 import json

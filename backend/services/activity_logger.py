@@ -1,4 +1,4 @@
-# Copyright (c) 2026 左岚. All rights reserved.
+ 
 # activity_logger.py - 活动记录服务
 import json
 import uuid

@@ -1,4 +1,4 @@
-# Copyright (c) 2026 左岚. All rights reserved.
+ 
 """AI 写作 API - 使用 SkillExecutor 完整复用 .claude/skills 工作流"""
 
 import json

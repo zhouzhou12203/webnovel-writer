@@ -1,4 +1,4 @@
-# Copyright (c) 2026 左岚. All rights reserved.
+ 
 """AI 服务模块 - 对接 OpenAI 兼容 API"""
 
 import os

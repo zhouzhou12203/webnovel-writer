@@ -1,4 +1,4 @@
-# Copyright (c) 2026 左岚. All rights reserved.
+ 
 你是一名专业网文质检编辑。请根据以下参考资料对照检查正文。
 
 ## 核心约束

@@ -1,4 +1,4 @@
-# Copyright (c) 2026 左岚. All rights reserved.
+ 
 """通用工具函数"""
 
 def chinese_to_arabic(cn: str) -> int:
