@@ -1,0 +1,16 @@
+.git
+node_modules
+frontend/node_modules
+**/__pycache__
+**/*.pyc
+.DS_Store
+dist
+.venv
+.webnovel
+*.db
+vectors.db
+rag.db
+index.db
+state.json
+.env
+

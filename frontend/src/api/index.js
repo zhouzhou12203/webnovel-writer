@@ -3,8 +3,18 @@
 
 import axios from 'axios'
 
+// 运行策略：
+// - Docker 生产环境：建议通过 Nginx 反代为同源路径 `/api`
+// - 本地开发：可在 .env.development 设置 VITE_API_BASE_URL=http://localhost:8080/api
+// 注意：不要对关键字 `import` 做 typeof 检查，使用 import.meta 访问 Vite 环境变量
+const API_BASE = (import.meta && import.meta.env && import.meta.env.VITE_API_BASE_URL)
+  ? import.meta.env.VITE_API_BASE_URL
+  : (typeof window !== 'undefined' && window.__API_BASE_URL__
+      ? window.__API_BASE_URL__
+      : '/api')
+
 const api = axios.create({
-    baseURL: 'http://localhost:8080/api',
+    baseURL: API_BASE,
     timeout: 600000, // 10分钟超时，支持 AI 长时间请求
     headers: {
         'Content-Type': 'application/json'
